@@ -169,14 +169,14 @@ impl PerfArgs {
 /// }
 /// ```
 ///
-/// This also works with `#[gpui::test]`s, though in most cases it shouldn't
+/// This also works with `#[nekowg::test]`s, though in most cases it shouldn't
 /// be used with automatic iterations.
 /// ```rust,ignore
 /// use util_macros::perf;
 ///
 /// #[perf(iterations = 1, critical)]
-/// #[gpui::test]
-/// fn oneshot_test(_cx: &mut gpui::TestAppContext) {
+/// #[nekowg::test]
+/// fn oneshot_test(_cx: &mut nekowg::TestAppContext) {
 ///     // Test goes here.
 /// }
 /// ```

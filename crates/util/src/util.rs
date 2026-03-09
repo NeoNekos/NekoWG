@@ -29,7 +29,7 @@ use std::{
 };
 use unicase::UniCase;
 
-pub use gpui_util::*;
+pub use nekowg_util::*;
 
 pub use take_until::*;
 #[cfg(any(test, feature = "test-support"))]

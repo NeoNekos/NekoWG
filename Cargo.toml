@@ -4,15 +4,15 @@ members = [
     "crates/collections",
     "crates/refineable",
     "crates/refineable/derive_refineable",
-    "crates/gpui",
-    "crates/gpui_linux",
-    "crates/gpui_macos",
-    "crates/gpui_macros",
-    "crates/gpui_platform",
-    "crates/gpui_util",
-    "crates/gpui_web",
-    "crates/gpui_wgpu",
-    "crates/gpui_windows",
+    "crates/nekowg",
+    "crates/nekowg_linux",
+    "crates/nekowg_macos",
+    "crates/nekowg_macros",
+    "crates/nekowg_platform",
+    "crates/nekowg_util",
+    "crates/nekowg_web",
+    "crates/nekowg_wgpu",
+    "crates/nekowg_windows",
     "crates/http_client",
     "crates/http_client_tls",
     "crates/media",
@@ -23,7 +23,7 @@ members = [
     "crates/util_macros",
     "tooling/perf",
 ]
-default-members = ["crates/gpui"]
+default-members = ["crates/nekowg"]
 
 [workspace.package]
 publish = false
@@ -109,16 +109,16 @@ git_hosting_providers = { path = "crates/git_hosting_providers" }
 git_ui = { path = "crates/git_ui" }
 go_to_line = { path = "crates/go_to_line" }
 google_ai = { path = "crates/google_ai" }
-gpui = { path = "crates/gpui", default-features = false }
-gpui_linux = { path = "crates/gpui_linux", default-features = false }
-gpui_macos = { path = "crates/gpui_macos", default-features = false }
-gpui_macros = { path = "crates/gpui_macros" }
-gpui_platform = { path = "crates/gpui_platform", default-features = false }
-gpui_web = { path = "crates/gpui_web" }
-gpui_wgpu = { path = "crates/gpui_wgpu" }
-gpui_windows = { path = "crates/gpui_windows", default-features = false }
-gpui_tokio = { path = "crates/gpui_tokio" }
-gpui_util = { path = "crates/gpui_util" }
+nekowg = { package = "nekowg", path = "crates/nekowg", default-features = false }
+nekowg_linux = { package = "nekowg_linux", path = "crates/nekowg_linux", default-features = false }
+nekowg_macos = { package = "nekowg_macos", path = "crates/nekowg_macos", default-features = false }
+nekowg_macros = { package = "nekowg_macros", path = "crates/nekowg_macros" }
+nekowg_platform = { package = "nekowg_platform", path = "crates/nekowg_platform", default-features = false }
+nekowg_web = { package = "nekowg_web", path = "crates/nekowg_web" }
+nekowg_wgpu = { package = "nekowg_wgpu", path = "crates/nekowg_wgpu" }
+nekowg_windows = { package = "nekowg_windows", path = "crates/nekowg_windows", default-features = false }
+nekowg_tokio = { path = "crates/nekowg_tokio" }
+nekowg_util = { package = "nekowg_util", path = "crates/nekowg_util" }
 html_to_markdown = { path = "crates/html_to_markdown" }
 http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }
@@ -642,7 +642,7 @@ debug = true
 
 [profile.dev.package]
 # proc-macros start
-gpui_macros = { opt-level = 3 }
+nekowg_macros = { opt-level = 3 }
 derive_refineable = { opt-level = 3 }
 settings_macros = { opt-level = 3 }
 sqlez_macros = { opt-level = 3, codegen-units = 1 }

@@ -1,2 +1,2 @@
 # NekoWG
-GPUI fork.
+NekoWG fork.

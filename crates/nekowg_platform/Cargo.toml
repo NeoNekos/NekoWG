@@ -1,0 +1,37 @@
+[package]
+name = "nekowg_platform"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/nekowg_platform.rs"
+
+[features]
+default = []
+font-kit = ["nekowg_macos/font-kit"]
+test-support = ["nekowg/test-support", "nekowg_macos/test-support"]
+screen-capture = ["nekowg/screen-capture", "nekowg_macos/screen-capture", "nekowg_windows/screen-capture", "nekowg_linux/screen-capture"]
+runtime_shaders = ["nekowg_macos/runtime_shaders"]
+wayland = ["nekowg_linux/wayland"]
+x11 = ["nekowg_linux/x11"]
+
+[dependencies]
+nekowg.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nekowg_macos.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nekowg_windows.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+nekowg_linux.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+nekowg_web.workspace = true
+console_error_panic_hook = "0.1.7"
