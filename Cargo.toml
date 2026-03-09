@@ -21,9 +21,6 @@ members = [
     "crates/sum_tree",
     "crates/util",
     "crates/util_macros",
-    "crates/zlog",
-    "crates/ztracing",
-    "crates/ztracing_macro",
     "tooling/perf",
 ]
 default-members = ["crates/gpui"]
@@ -249,11 +246,6 @@ zed_actions = { path = "crates/zed_actions" }
 zed_env_vars = { path = "crates/zed_env_vars" }
 edit_prediction = { path = "crates/edit_prediction" }
 zeta_prompt = { path = "crates/zeta_prompt" }
-zlog = { path = "crates/zlog" }
-zlog_settings = { path = "crates/zlog_settings" }
-ztracing = { path = "crates/ztracing" }
-ztracing_macro = { path = "crates/ztracing_macro" }
-
 #
 # External crates
 #
