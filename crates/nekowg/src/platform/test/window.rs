@@ -275,7 +275,7 @@ impl PlatformWindow for TestWindow {
 
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
-    fn draw(&self, _scene: &crate::Scene) {}
+    fn draw(&self, _frame: &crate::RenderFrame<'_>) {}
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
         self.0.lock().sprite_atlas.clone()

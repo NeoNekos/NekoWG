@@ -208,7 +208,11 @@ impl WindowsWindowInner {
 
         self.state.logical_size.set(new_logical_size);
         if should_resize_renderer
-            && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
+            && let Err(e) = self
+                .state
+                .renderer
+                .borrow_mut()
+                .update_drawable_size(device_size)
         {
             log::error!("Failed to resize renderer, invalidating devices: {}", e);
             self.state

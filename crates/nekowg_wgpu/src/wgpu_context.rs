@@ -150,7 +150,7 @@ impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn instance() -> wgpu::Instance {
         wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends: wgpu::Backends::all(),
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),

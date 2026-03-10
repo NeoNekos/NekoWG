@@ -1,16 +1,15 @@
 [package]
 name = "nekowg"
-version = "0.2.2"
+version = "0.2.3"
 edition.workspace = true
 authors = ["Nathan Sobo <nathan@zed.dev>", "Yamrc <yamrci@outlook.com>"]
 description = "NekoWG core UI crate"
-repository = "https://github.com/Yamrc/NekoWG"
+repository = "https://github.com/NeoNekos/NekoWG"
 publish = true
 license = "Apache-2.0"
 readme = "README.md"
 keywords = ["desktop", "gui", "immediate"]
 categories = ["gui"]
-
 
 [lints]
 workspace = true
@@ -100,6 +99,7 @@ pollster.workspace = true
 url.workspace = true
 uuid.workspace = true
 web-time.workspace = true
+wgpu.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.3.4", features = ["wasm_js"] }
@@ -238,3 +238,7 @@ path = "examples/grid_layout.rs"
 [[example]]
 name = "mouse_pressure"
 path = "examples/mouse_pressure.rs"
+
+[[example]]
+name = "gpu_primitive"
+path = "examples/gpu_primitive.rs"

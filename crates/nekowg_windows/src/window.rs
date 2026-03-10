@@ -13,6 +13,7 @@ use std::{
 use ::util::ResultExt;
 use anyhow::{Context as _, Result};
 use futures::channel::oneshot::{self, Receiver};
+use nekowg_wgpu::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use windows::{
@@ -30,6 +31,140 @@ use crate::*;
 use nekowg::*;
 
 pub(crate) struct WindowsWindow(pub Rc<WindowsWindowInner>);
+
+struct WgpuRawWindow {
+    hwnd: HWND,
+}
+
+impl rwh::HasWindowHandle for WgpuRawWindow {
+    fn window_handle(&self) -> std::result::Result<rwh::WindowHandle<'_>, rwh::HandleError> {
+        let Some(hwnd) = NonZeroIsize::new(self.hwnd.0 as isize) else {
+            return Err(rwh::HandleError::Unavailable);
+        };
+        let raw = rwh::Win32WindowHandle::new(hwnd).into();
+        Ok(unsafe { rwh::WindowHandle::borrow_raw(raw) })
+    }
+}
+
+impl rwh::HasDisplayHandle for WgpuRawWindow {
+    fn display_handle(&self) -> std::result::Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
+        Ok(rwh::DisplayHandle::windows())
+    }
+}
+
+pub(crate) enum WindowsRenderer {
+    DirectX(DirectXRenderer),
+    Wgpu(WgpuRenderer),
+}
+
+impl WindowsRenderer {
+    fn new(
+        hwnd: HWND,
+        directx_devices: &DirectXDevices,
+        disable_direct_composition: bool,
+        drawable_size: Size<DevicePixels>,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<Self> {
+        if prefer_wgpu_renderer() {
+            let raw_window = WgpuRawWindow { hwnd };
+            let config = WgpuSurfaceConfig {
+                size: size(
+                    DevicePixels(drawable_size.width.0.max(1)),
+                    DevicePixels(drawable_size.height.0.max(1)),
+                ),
+                transparent: is_transparent_background(background_appearance),
+            };
+            let gpu_context: GpuContext = Default::default();
+            match WgpuRenderer::new(gpu_context, &raw_window, config, None) {
+                Ok(mut renderer) => {
+                    renderer.update_transparency(is_transparent_background(background_appearance));
+                    return Ok(Self::Wgpu(renderer));
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Failed to initialize wgpu renderer on Windows; falling back to DirectX: {error:#}"
+                    );
+                }
+            }
+        }
+
+        DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
+            .map(Self::DirectX)
+            .context("Creating DirectX renderer")
+    }
+
+    fn draw(
+        &mut self,
+        frame: &nekowg::RenderFrame<'_>,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<()> {
+        match self {
+            Self::DirectX(renderer) => renderer.draw(frame.scene, background_appearance),
+            Self::Wgpu(renderer) => {
+                renderer.update_transparency(is_transparent_background(background_appearance));
+                renderer.draw(frame);
+                Ok(())
+            }
+        }
+    }
+
+    fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+        match self {
+            Self::DirectX(renderer) => renderer.sprite_atlas(),
+            Self::Wgpu(renderer) => renderer.sprite_atlas().clone(),
+        }
+    }
+
+    fn gpu_specs(&self) -> Result<GpuSpecs> {
+        match self {
+            Self::DirectX(renderer) => renderer.gpu_specs(),
+            Self::Wgpu(renderer) => Ok(renderer.gpu_specs()),
+        }
+    }
+
+    pub(crate) fn update_drawable_size(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
+        match self {
+            Self::DirectX(renderer) => renderer.resize(new_size),
+            Self::Wgpu(renderer) => {
+                renderer.update_drawable_size(new_size);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+        match self {
+            Self::DirectX(renderer) => renderer.handle_device_lost(directx_devices),
+            Self::Wgpu(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn mark_drawable(&mut self) {
+        match self {
+            Self::DirectX(renderer) => renderer.mark_drawable(),
+            Self::Wgpu(_) => {}
+        }
+    }
+
+    fn set_background_appearance(&mut self, background_appearance: WindowBackgroundAppearance) {
+        if let Self::Wgpu(renderer) = self {
+            renderer.update_transparency(is_transparent_background(background_appearance));
+        }
+    }
+
+    fn supports_gpu_primitives(&self) -> bool {
+        matches!(self, Self::Wgpu(_))
+    }
+}
+
+fn is_transparent_background(background_appearance: WindowBackgroundAppearance) -> bool {
+    background_appearance != WindowBackgroundAppearance::Opaque
+}
+
+fn prefer_wgpu_renderer() -> bool {
+    !std::env::var("NEKOWG_WINDOWS_RENDERER")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("directx"))
+}
 
 impl std::ops::Deref for WindowsWindow {
     type Target = WindowsWindowInner;
@@ -58,7 +193,7 @@ pub struct WindowsWindowState {
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
 
-    pub renderer: RefCell<DirectXRenderer>,
+    pub renderer: RefCell<WindowsRenderer>,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -104,22 +239,26 @@ impl WindowsWindowState {
             let monitor_dpi = unsafe { GetDpiForWindow(hwnd) } as f32;
             monitor_dpi / USER_DEFAULT_SCREEN_DPI as f32
         };
+        let physical_size = size(
+            DevicePixels(window_params.cx),
+            DevicePixels(window_params.cy),
+        );
         let origin = logical_point(window_params.x as f32, window_params.y as f32, scale_factor);
-        let logical_size = {
-            let physical_size = size(
-                DevicePixels(window_params.cx),
-                DevicePixels(window_params.cy),
-            );
-            physical_size.to_pixels(scale_factor)
-        };
+        let logical_size = physical_size.to_pixels(scale_factor);
         let fullscreen_restore_bounds = Bounds {
             origin,
             size: logical_size,
         };
         let border_offset = WindowBorderOffset::default();
         let restore_from_minimized = None;
-        let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
-            .context("Creating DirectX renderer")?;
+        let background_appearance = WindowBackgroundAppearance::Opaque;
+        let renderer = WindowsRenderer::new(
+            hwnd,
+            directx_devices,
+            disable_direct_composition,
+            physical_size,
+            background_appearance,
+        )?;
         let callbacks = Callbacks::default();
         let input_handler = None;
         let pending_surrogate = None;
@@ -137,7 +276,7 @@ impl WindowsWindowState {
             fullscreen_restore_bounds: Cell::new(fullscreen_restore_bounds),
             border_offset,
             appearance: Cell::new(appearance),
-            background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
+            background_appearance: Cell::new(background_appearance),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
             min_size,
@@ -532,10 +671,9 @@ impl rwh::HasWindowHandle for WindowsWindow {
     }
 }
 
-// todo(windows)
 impl rwh::HasDisplayHandle for WindowsWindow {
     fn display_handle(&self) -> std::result::Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
-        unimplemented!()
+        Ok(rwh::DisplayHandle::windows())
     }
 }
 
@@ -806,6 +944,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         self.state.background_appearance.set(background_appearance);
+        self.state
+            .renderer
+            .borrow_mut()
+            .set_background_appearance(background_appearance);
         let hwnd = self.0.hwnd;
 
         // using Dwm APIs for Mica and MicaAlt backdrops.
@@ -915,11 +1057,11 @@ impl PlatformWindow for WindowsWindow {
             .set(Some(callback));
     }
 
-    fn draw(&self, scene: &Scene) {
+    fn draw(&self, frame: &nekowg::RenderFrame<'_>) {
         self.state
             .renderer
             .borrow_mut()
-            .draw(scene, self.state.background_appearance.get())
+            .draw(frame, self.state.background_appearance.get())
             .log_err();
     }
 
@@ -933,6 +1075,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.state.renderer.borrow().gpu_specs().log_err()
+    }
+
+    fn supports_gpu_primitives(&self) -> bool {
+        self.state.renderer.borrow().supports_gpu_primitives()
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {

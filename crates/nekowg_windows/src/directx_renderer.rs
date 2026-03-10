@@ -315,6 +315,7 @@ impl DirectXRenderer {
 
         self.upload_scene_buffers(scene)?;
 
+        let mut warned_about_gpu_primitives = false;
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
@@ -335,6 +336,15 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::GpuPrimitives(_) => {
+                    if !warned_about_gpu_primitives {
+                        log::warn!(
+                            "GPU primitives are currently only executed by the wgpu backend; skipping them on DirectX"
+                        );
+                        warned_about_gpu_primitives = true;
+                    }
+                    Ok(())
+                }
             }
             .context(format!(
                 "scene too large:\

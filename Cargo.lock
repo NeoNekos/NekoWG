@@ -3395,7 +3395,7 @@ dependencies = [
 
 [[package]]
 name = "nekowg"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -3477,6 +3477,7 @@ dependencies = [
  "waker-fn",
  "wasm-bindgen",
  "web-time",
+ "wgpu",
  "windows 0.61.3",
  "zed-font-kit",
  "zed-scap",
@@ -3558,6 +3559,7 @@ dependencies = [
  "media",
  "metal",
  "nekowg",
+ "nekowg_wgpu",
  "objc",
  "parking_lot",
  "pathfinder_geometry",
@@ -3663,6 +3665,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "nekowg",
+ "nekowg_wgpu",
  "parking_lot",
  "rand 0.9.2",
  "raw-window-handle",

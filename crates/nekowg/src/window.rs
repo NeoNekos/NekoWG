@@ -5,19 +5,20 @@ use crate::{
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
-    FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
+    FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuFrameState, GpuNode, GpuNodeId,
+    GpuPrimitive, GpuPrimitiveDescriptor, GpuResult, GpuSpecs, Hsla, InputHandler, IsZero,
     KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
     LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    PromptLevel, Quad, Render, RenderFrame, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
+    Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
+    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -742,6 +743,7 @@ pub(crate) struct Frame {
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
+    pub(crate) gpu: GpuFrameState,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
@@ -779,7 +781,10 @@ pub(crate) struct PaintIndex {
 }
 
 impl Frame {
-    pub(crate) fn new(dispatch_tree: DispatchTree) -> Self {
+    pub(crate) fn new(
+        dispatch_tree: DispatchTree,
+        gpu_registry: Rc<RefCell<crate::gpu::GpuNodeRegistry>>,
+    ) -> Self {
         Frame {
             focus: None,
             window_active: false,
@@ -788,6 +793,7 @@ impl Frame {
             mouse_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
+            gpu: GpuFrameState::new(gpu_registry),
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
@@ -813,6 +819,7 @@ impl Frame {
         self.mouse_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
+        self.gpu.clear_for_reuse();
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
@@ -897,6 +904,7 @@ pub struct Window {
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
+    next_gpu_frame_id: u64,
     display_id: Option<DisplayId>,
     sprite_atlas: Arc<dyn PlatformAtlas>,
     text_system: Arc<WindowTextSystem>,
@@ -1385,11 +1393,14 @@ impl Window {
 
         platform_window.map_window().unwrap();
 
+        let gpu_nodes = crate::gpu::new_gpu_registry();
+
         Ok(Window {
             handle,
             invalidator,
             removed: false,
             platform_window,
+            next_gpu_frame_id: 1,
             display_id,
             sprite_atlas,
             text_system,
@@ -1406,8 +1417,14 @@ impl Window {
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
-            rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
-            next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            rendered_frame: Frame::new(
+                DispatchTree::new(cx.keymap.clone(), cx.actions.clone()),
+                gpu_nodes.clone(),
+            ),
+            next_frame: Frame::new(
+                DispatchTree::new(cx.keymap.clone(), cx.actions.clone()),
+                gpu_nodes,
+            ),
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -2197,6 +2214,8 @@ impl Window {
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        self.next_frame.gpu.set_frame_id(self.next_gpu_frame_id);
+        self.next_gpu_frame_id += 1;
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -2266,7 +2285,11 @@ impl Window {
 
     #[profiling::function]
     fn present(&self) {
-        self.platform_window.draw(&self.rendered_frame.scene);
+        self.platform_window.draw(&RenderFrame {
+            scene: &self.rendered_frame.scene,
+            gpu: &self.rendered_frame.gpu,
+        });
+        self.rendered_frame.gpu.finish_frame();
         self.needs_present.set(false);
         profiling::finish_frame!();
     }
@@ -3510,6 +3533,62 @@ impl Window {
             content_mask,
             image_buffer,
         });
+    }
+
+    /// Inserts a GPU node into this window and returns its stable node id.
+    ///
+    /// The node is window-local. All callbacks run on the owning window/renderer thread.
+    pub fn insert_gpu_node(&mut self, node: impl GpuNode + 'static) -> GpuNodeId {
+        self.rendered_frame.gpu.insert_node(node)
+    }
+
+    /// Retires a GPU node.
+    ///
+    /// Retirement is deferred: any primitive already captured into the current frame continues to
+    /// use the node, and `GpuNode::destroy` runs after the frame finishes encoding.
+    pub fn remove_gpu_node(&mut self, id: GpuNodeId) -> GpuResult<()> {
+        self.rendered_frame.gpu.retire_node(id)
+    }
+
+    /// Pushes a scene-integrated GPU primitive during the paint phase.
+    ///
+    /// This schedules GPU work for the current frame only. Returns an error if the platform
+    /// renderer does not support GPU primitives or if the node id is not live for scheduling.
+    pub fn push_gpu_primitive(&mut self, primitive: GpuPrimitiveDescriptor) -> GpuResult<()> {
+        self.invalidator.debug_assert_paint();
+
+        if !self.platform_window.supports_gpu_primitives() {
+            return Err(crate::GpuError::UnsupportedBackend(
+                "platform renderer does not support GPU primitives",
+            ));
+        }
+
+        if !self.next_frame.gpu.can_schedule(primitive.node) {
+            return Err(crate::GpuError::InvalidNodeId);
+        }
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask().scale(scale_factor);
+        let opacity = (self.element_opacity() * primitive.opacity).clamp(0.0, 1.0);
+
+        self.next_frame.scene.insert_primitive(GpuPrimitive {
+            order: 0,
+            bounds: primitive.bounds.scale(scale_factor),
+            content_mask,
+            opacity,
+            transformation: primitive.transformation,
+            node: primitive.node,
+            phase: primitive.phase,
+        });
+
+        Ok(())
+    }
+
+    /// Returns whether the current platform renderer supports scene-integrated GPU primitives.
+    ///
+    /// Use this to guard optional GPU primitives and fall back to retained rendering when needed.
+    pub fn supports_gpu_primitives(&self) -> bool {
+        self.platform_window.supports_gpu_primitives()
     }
 
     /// Removes an image from the sprite atlas.

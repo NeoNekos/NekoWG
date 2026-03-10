@@ -27,6 +27,7 @@ futures.workspace = true
 image.workspace = true
 itertools.workspace = true
 log.workspace = true
+nekowg_wgpu.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 raw-window-handle = "0.6"

@@ -2,13 +2,15 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use log::warn;
 use nekowg::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, GpuEncodeContext, GpuFrameTargetRef,
+    GpuPrepareContext, GpuSpecs, MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch,
+    Quad, RenderFrame, ScaledPixels, Shadow, Size, SubpixelSprite, Underline,
+    get_gamma_correction_ratios,
 };
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -1035,7 +1037,8 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    pub fn draw(&mut self, render_frame: &RenderFrame<'_>) {
+        let scene = render_frame.scene;
         let last_error = self.last_error.lock().unwrap().take();
         if let Some(error) = last_error {
             self.failed_frame_count += 1;
@@ -1076,6 +1079,13 @@ impl WgpuRenderer {
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let target_size = self.viewport_size();
+        let frame_target = GpuFrameTargetRef {
+            view: &frame_view,
+            format: self.surface_config.format,
+            size: target_size,
+        };
+        render_frame.gpu.begin_wgpu_frame(target_size);
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
@@ -1149,6 +1159,8 @@ impl WgpuRenderer {
                     depth_stencil_attachment: None,
                     ..Default::default()
                 });
+                let mut prepared_nodes = HashSet::new();
+                let mut skipped_nodes = HashSet::new();
 
                 for batch in scene.batches() {
                     let ok = match batch {
@@ -1228,6 +1240,54 @@ impl WgpuRenderer {
                         PrimitiveBatch::Surfaces(_surfaces) => {
                             // Surfaces are macOS-only for video playback
                             // Not implemented for Linux/wgpu
+                            true
+                        }
+                        PrimitiveBatch::GpuPrimitives(range) => {
+                            for primitive in &scene.gpu_primitives[range] {
+                                if skipped_nodes.contains(&primitive.node) {
+                                    continue;
+                                }
+
+                                if prepared_nodes.insert(primitive.node) {
+                                    let mut prepare_context = GpuPrepareContext {
+                                        device: &self.resources().device,
+                                        queue: &self.resources().queue,
+                                        target_format: self.surface_config.format,
+                                        target_size,
+                                        frame_id: render_frame.gpu.frame_id(),
+                                    };
+
+                                    if let Err(error) = render_frame
+                                        .gpu
+                                        .prepare_node(primitive.node, &mut prepare_context)
+                                    {
+                                        log::error!(
+                                            "GPU node {:?} prepare failed for frame {}: {error}",
+                                            primitive.node,
+                                            render_frame.gpu.frame_id()
+                                        );
+                                        skipped_nodes.insert(primitive.node);
+                                        continue;
+                                    }
+                                }
+
+                                let mut encode_context = GpuEncodeContext::new(
+                                    frame_target,
+                                    primitive,
+                                    &mut pass,
+                                    render_frame.gpu.frame_id(),
+                                );
+                                if let Err(error) = render_frame
+                                    .gpu
+                                    .encode_node(primitive.node, &mut encode_context)
+                                {
+                                    log::error!(
+                                        "GPU node {:?} encode failed for frame {}: {error}",
+                                        primitive.node,
+                                        render_frame.gpu.frame_id()
+                                    );
+                                }
+                            }
                             true
                         }
                     };

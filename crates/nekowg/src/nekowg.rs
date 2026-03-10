@@ -25,6 +25,7 @@ mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
 mod global;
+mod gpu;
 mod input;
 mod inspector;
 mod interactive;
@@ -89,6 +90,7 @@ pub use elements::*;
 pub use executor::*;
 pub use geometry::*;
 pub use global::*;
+pub use gpu::*;
 pub use http_client;
 pub use input::*;
 pub use inspector::*;
@@ -121,6 +123,7 @@ pub use test::*;
 pub use text_system::*;
 pub use util::{FutureExt, Timeout};
 pub use view::*;
+pub use wgpu;
 pub use window::*;
 
 /// The context trait, allows the different contexts in NekoWG to be used

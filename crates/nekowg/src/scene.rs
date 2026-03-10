@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, GpuPhase,
+    GpuPrimitive, Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -36,6 +36,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub gpu_primitives: Vec<GpuPrimitive>,
 }
 
 #[expect(missing_docs)]
@@ -52,6 +53,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.gpu_primitives.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -80,11 +82,12 @@ impl Scene {
             return;
         }
 
-        let order = self
+        let base_order = self
             .layer_stack
             .last()
             .copied()
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        let order = phase_adjusted_order(base_order, primitive.phase());
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -119,6 +122,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::Gpu(gpu_primitive) => {
+                gpu_primitive.order = order;
+                self.gpu_primitives.push(gpu_primitive.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -146,6 +153,8 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.gpu_primitives
+            .sort_by_key(|primitive| (primitive.order, primitive.node));
     }
 
     #[cfg_attr(
@@ -173,8 +182,16 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            gpu_primitives_start: 0,
+            gpu_primitives_iter: self.gpu_primitives.iter().peekable(),
         }
     }
+}
+
+fn phase_adjusted_order(base_order: DrawOrder, phase: GpuPhase) -> DrawOrder {
+    base_order
+        .saturating_mul(4)
+        .saturating_add(phase.sort_key())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
@@ -195,6 +212,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    GpuPrimitive,
 }
 
 pub(crate) enum PaintOperation {
@@ -214,6 +232,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    Gpu(GpuPrimitive),
 }
 
 #[expect(missing_docs)]
@@ -228,6 +247,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::Gpu(gpu_primitive) => &gpu_primitive.bounds,
         }
     }
 
@@ -241,6 +261,14 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::Gpu(gpu_primitive) => &gpu_primitive.content_mask,
+        }
+    }
+
+    pub(crate) fn phase(&self) -> GpuPhase {
+        match self {
+            Primitive::Gpu(gpu_primitive) => gpu_primitive.phase,
+            _ => GpuPhase::Inline,
         }
     }
 }
@@ -269,6 +297,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    gpu_primitives_start: usize,
+    gpu_primitives_iter: Peekable<slice::Iter<'a, GpuPrimitive>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -301,6 +331,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.gpu_primitives_iter.peek().map(|p| p.order),
+                PrimitiveKind::GpuPrimitive,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -447,6 +481,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::GpuPrimitive => {
+                let primitives_start = self.gpu_primitives_start;
+                let mut primitives_end = primitives_start + 1;
+                self.gpu_primitives_iter.next();
+                while self
+                    .gpu_primitives_iter
+                    .next_if(|primitive| (primitive.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    primitives_end += 1;
+                }
+                self.gpu_primitives_start = primitives_end;
+                Some(PrimitiveBatch::GpuPrimitives(
+                    primitives_start..primitives_end,
+                ))
+            }
         }
     }
 }
@@ -479,6 +529,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    GpuPrimitives(Range<usize>),
 }
 
 #[derive(Default, Debug, Clone)]
@@ -723,6 +774,12 @@ pub struct PaintSurface {
 impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
+    }
+}
+
+impl From<GpuPrimitive> for Primitive {
+    fn from(primitive: GpuPrimitive) -> Self {
+        Primitive::Gpu(primitive)
     }
 }
 

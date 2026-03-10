@@ -47,6 +47,7 @@ log.workspace = true
 mach2.workspace = true
 media.workspace = true
 metal.workspace = true
+nekowg_wgpu.workspace = true
 objc.workspace = true
 parking_lot.workspace = true
 pathfinder_geometry = "0.5"

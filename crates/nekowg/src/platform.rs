@@ -32,9 +32,9 @@ use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
     ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
-    Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
-    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task,
-    ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
+    Point, Priority, RenderFrame, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab,
+    Task, ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
@@ -487,10 +487,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
-    fn draw(&self, scene: &Scene);
+    fn draw(&self, frame: &RenderFrame<'_>);
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
+    fn supports_gpu_primitives(&self) -> bool {
+        false
+    }
 
     // macOS specific methods
     fn get_title(&self) -> String {
@@ -550,7 +553,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
     #[cfg(any(test, feature = "test-support"))]
-    fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
+    fn render_to_image(&self, _scene: &crate::Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
 }

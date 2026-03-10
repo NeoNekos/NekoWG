@@ -1541,17 +1541,21 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().toggle_tab_bar_callback = Some(callback);
     }
 
-    fn draw(&self, scene: &nekowg::Scene) {
+    fn draw(&self, frame: &nekowg::RenderFrame<'_>) {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        this.renderer.draw(frame);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        self.0.lock().renderer.sprite_atlas().clone()
+        self.0.lock().renderer.sprite_atlas()
     }
 
     fn gpu_specs(&self) -> Option<nekowg::GpuSpecs> {
-        None
+        self.0.lock().renderer.gpu_specs()
+    }
+
+    fn supports_gpu_primitives(&self) -> bool {
+        self.0.lock().renderer.supports_gpu_primitives()
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {

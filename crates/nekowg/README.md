@@ -51,6 +51,20 @@ NekoWG offers three different [registers](<https://en.wikipedia.org/wiki/Registe
 
 Each of these registers has one or more corresponding contexts that can be accessed from all NekoWG services. This context is your main interface to NekoWG, and is used extensively throughout the framework.
 
+## GPU Callbacks (Current-Target)
+
+NekoWG exposes a low-level, scene-integrated GPU callback API for advanced rendering on the
+current window target. This is useful for fullscreen effects, custom visualizations, and
+GPU-accelerated drawing that does not fit into the retained rendering model.
+
+High-level flow:
+
+1. Implement `GpuNode` to prepare GPU resources and encode draw commands.
+2. Register the node with `Window::insert_gpu_node`.
+3. Schedule the node each frame via `Window::push_gpu_primitive`.
+
+See `examples/gpu_primitive.rs` for a working end-to-end example.
+
 ## Other Resources
 
 In addition to the systems above, NekoWG provides a range of smaller services that are useful for building complex applications:
