@@ -326,6 +326,9 @@ impl ImageCache for RetainAllImageCache {
     }
 }
 
+/// Default memory budget for the global LRU image cache.
+pub const DEFAULT_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Constructs a retain-all image cache that uses the element state associated with the given ID.
 pub fn retain_all(id: impl Into<ElementId>) -> RetainAllImageCacheProvider {
     RetainAllImageCacheProvider { id: id.into() }
@@ -344,6 +347,224 @@ impl ImageCacheProvider for RetainAllImageCacheProvider {
                     global_id,
                     |cache, _window| {
                         let mut cache = cache.unwrap_or_else(|| RetainAllImageCache::new(cx));
+                        (cache.clone(), cache)
+                    },
+                )
+            })
+            .into()
+    }
+}
+
+/// An LRU image cache that evicts entries when it exceeds a byte budget.
+pub struct LruImageCache {
+    entries: HashMap<u64, LruImageCacheEntry>,
+    max_bytes: usize,
+    current_bytes: usize,
+    clock: u64,
+}
+
+struct LruImageCacheEntry {
+    item: ImageCacheItem,
+    last_used: u64,
+    bytes: usize,
+    source: Resource,
+}
+
+impl LruImageCache {
+    /// Create a new LRU image cache with a maximum memory budget in bytes.
+    #[inline]
+    pub fn new(max_bytes: usize, cx: &mut App) -> Entity<Self> {
+        let e = cx.new(|_cx| LruImageCache {
+            entries: HashMap::new(),
+            max_bytes,
+            current_bytes: 0,
+            clock: 0,
+        });
+        cx.observe_release(&e, |image_cache, cx| {
+            for (_, entry) in std::mem::replace(&mut image_cache.entries, HashMap::new()) {
+                image_cache.evict_entry(entry, None, cx);
+            }
+            image_cache.current_bytes = 0;
+        })
+        .detach();
+        e
+    }
+
+    /// Load an image from the given source.
+    /// Returns `None` if the image is loading.
+    pub fn load(
+        &mut self,
+        source: &Resource,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        let hash = hash(source);
+        self.clock = self.clock.wrapping_add(1);
+        let now = self.clock;
+
+        if let Some(entry) = self.entries.get_mut(&hash) {
+            entry.last_used = now;
+            let result = entry.item.get();
+            if let Some(result) = &result {
+                let new_bytes = result
+                    .as_ref()
+                    .map(|image| image.memory_bytes_len())
+                    .unwrap_or(0);
+                if new_bytes != entry.bytes {
+                    let old_bytes = entry.bytes;
+                    if new_bytes > entry.bytes {
+                        self.current_bytes += new_bytes - entry.bytes;
+                    } else {
+                        self.current_bytes -= entry.bytes - new_bytes;
+                    }
+                    entry.bytes = new_bytes;
+                    if log::log_enabled!(log::Level::Debug) {
+                        log::debug!(
+                            "image cache bytes update: source={:?} bytes={} -> {} current={} max={}",
+                            entry.source,
+                            old_bytes,
+                            new_bytes,
+                            self.current_bytes,
+                            self.max_bytes
+                        );
+                    }
+                }
+                self.evict_if_needed(window, cx);
+            }
+            return result;
+        }
+
+        let fut = AssetLogger::<ImageAssetLoader>::load(source.clone(), cx);
+        let task = cx.background_executor().spawn(fut).shared();
+        self.entries.insert(
+            hash,
+            LruImageCacheEntry {
+                item: ImageCacheItem::Loading(task.clone()),
+                last_used: now,
+                bytes: 0,
+                source: source.clone(),
+            },
+        );
+
+        let entity = window.current_view();
+        window
+            .spawn(cx, {
+                async move |cx| {
+                    _ = task.await;
+                    cx.on_next_frame(move |_, cx| {
+                        cx.notify(entity);
+                    });
+                }
+            })
+            .detach();
+
+        None
+    }
+
+    fn evict_if_needed(&mut self, window: &mut Window, cx: &mut App) {
+        while self.current_bytes > self.max_bytes {
+            let Some(candidate) = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.bytes > 0)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(hash, _)| *hash)
+            else {
+                break;
+            };
+
+            if let Some(entry) = self.entries.remove(&candidate) {
+                self.current_bytes = self.current_bytes.saturating_sub(entry.bytes);
+                if log::log_enabled!(log::Level::Debug) {
+                    log::debug!(
+                        "image cache evict: source={:?} bytes={} current={} max={}",
+                        entry.source,
+                        entry.bytes,
+                        self.current_bytes,
+                        self.max_bytes
+                    );
+                }
+                self.evict_entry(entry, Some(window), cx);
+            }
+        }
+    }
+
+    fn evict_entry(
+        &self,
+        mut entry: LruImageCacheEntry,
+        window: Option<&mut Window>,
+        cx: &mut App,
+    ) {
+        if let Some(result) = entry.item.get() {
+            if let Ok(image) = result {
+                cx.drop_image(image, window);
+            }
+        }
+        cx.remove_asset::<AssetLogger<ImageAssetLoader>>(&entry.source);
+    }
+
+    /// Clear the image cache.
+    pub fn clear(&mut self, window: &mut Window, cx: &mut App) {
+        for (_, entry) in std::mem::replace(&mut self.entries, HashMap::new()) {
+            self.evict_entry(entry, Some(window), cx);
+        }
+        self.current_bytes = 0;
+    }
+
+    /// Remove the image from the cache by the given source.
+    pub fn remove(&mut self, source: &Resource, window: &mut Window, cx: &mut App) {
+        let hash = hash(source);
+        if let Some(entry) = self.entries.remove(&hash) {
+            self.current_bytes = self.current_bytes.saturating_sub(entry.bytes);
+            self.evict_entry(entry, Some(window), cx);
+        }
+    }
+
+    /// Returns the number of images in the cache.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl ImageCache for LruImageCache {
+    fn load(
+        &mut self,
+        resource: &Resource,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        LruImageCache::load(self, resource, window, cx)
+    }
+}
+
+/// Constructs an LRU image cache that uses the element state associated with the given ID.
+pub fn lru(id: impl Into<ElementId>, max_bytes: usize) -> LruImageCacheProvider {
+    LruImageCacheProvider {
+        id: id.into(),
+        max_bytes,
+    }
+}
+
+/// A provider struct for creating an LRU image cache inline.
+pub struct LruImageCacheProvider {
+    id: ElementId,
+    max_bytes: usize,
+}
+
+impl ImageCacheProvider for LruImageCacheProvider {
+    fn provide(&mut self, window: &mut Window, cx: &mut App) -> AnyImageCache {
+        let max_bytes = self.max_bytes;
+        window
+            .with_global_id(self.id.clone(), |global_id, window| {
+                window.with_element_state::<Entity<LruImageCache>, _>(
+                    global_id,
+                    |cache, _window| {
+                        let mut cache = cache.unwrap_or_else(|| LruImageCache::new(max_bytes, cx));
                         (cache.clone(), cache)
                     },
                 )

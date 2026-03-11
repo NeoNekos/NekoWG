@@ -32,9 +32,9 @@ use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
     ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
-    Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
-    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task,
-    ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
+    Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderImageSource,
+    RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
+    SystemWindowTab, Task, ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
@@ -1892,9 +1892,10 @@ impl Image {
             Ok(SmallVec::from_elem(Frame::new(data), 1))
         }
 
+        let bytes: Arc<[u8]> = Arc::from(self.bytes.clone().into_boxed_slice());
         let frames = match self.format {
             ImageFormat::Gif => {
-                let decoder = GifDecoder::new(Cursor::new(&self.bytes))?;
+                let decoder = GifDecoder::new(Cursor::new(&bytes))?;
                 let mut frames = SmallVec::new();
 
                 for frame in decoder.into_frames() {
@@ -1908,20 +1909,34 @@ impl Image {
 
                 frames
             }
-            ImageFormat::Png => frames_for_image(&self.bytes, image::ImageFormat::Png)?,
-            ImageFormat::Jpeg => frames_for_image(&self.bytes, image::ImageFormat::Jpeg)?,
-            ImageFormat::Webp => frames_for_image(&self.bytes, image::ImageFormat::WebP)?,
-            ImageFormat::Bmp => frames_for_image(&self.bytes, image::ImageFormat::Bmp)?,
-            ImageFormat::Tiff => frames_for_image(&self.bytes, image::ImageFormat::Tiff)?,
-            ImageFormat::Ico => frames_for_image(&self.bytes, image::ImageFormat::Ico)?,
+            ImageFormat::Png => frames_for_image(&bytes, image::ImageFormat::Png)?,
+            ImageFormat::Jpeg => frames_for_image(&bytes, image::ImageFormat::Jpeg)?,
+            ImageFormat::Webp => frames_for_image(&bytes, image::ImageFormat::WebP)?,
+            ImageFormat::Bmp => frames_for_image(&bytes, image::ImageFormat::Bmp)?,
+            ImageFormat::Tiff => frames_for_image(&bytes, image::ImageFormat::Tiff)?,
+            ImageFormat::Ico => frames_for_image(&bytes, image::ImageFormat::Ico)?,
             ImageFormat::Svg => {
                 return svg_renderer
-                    .render_single_frame(&self.bytes, 1.0, false)
+                    .render_single_frame(&bytes, 1.0, false)
                     .map_err(Into::into);
             }
         };
 
-        Ok(Arc::new(RenderImage::new(frames)))
+        let mut image = RenderImage::new(frames);
+        if image.frame_count() == 1 && !matches!(self.format, ImageFormat::Gif | ImageFormat::Svg) {
+            let format = match self.format {
+                ImageFormat::Png => image::ImageFormat::Png,
+                ImageFormat::Jpeg => image::ImageFormat::Jpeg,
+                ImageFormat::Webp => image::ImageFormat::WebP,
+                ImageFormat::Bmp => image::ImageFormat::Bmp,
+                ImageFormat::Tiff => image::ImageFormat::Tiff,
+                ImageFormat::Ico => image::ImageFormat::Ico,
+                ImageFormat::Gif | ImageFormat::Svg => unreachable!(),
+            };
+            image = image.with_source(RenderImageSource::Raster { format, bytes });
+        }
+
+        Ok(Arc::new(image))
     }
 
     /// Get the format of the clipboard image

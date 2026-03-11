@@ -1,14 +1,14 @@
 use crate::{
-    AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, Element, ElementId,
-    Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, SharedUri, StyleRefinement, Styled, Task, Window, px,
+    AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, DevicePixels,
+    Element, ElementId, Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId,
+    InteractiveElement, Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage,
+    Resource, SharedString, SharedUri, StyleRefinement, Styled, Task, Window, px, size,
 };
 use anyhow::Result;
 
 use futures::Future;
 use image::{
-    AnimationDecoder, DynamicImage, Frame, ImageError, ImageFormat, Rgba,
+    AnimationDecoder, DynamicImage, Frame, Frames, ImageError, ImageFormat, Rgba,
     codecs::{gif::GifDecoder, webp::WebPDecoder},
 };
 use nekowg_util::ResultExt;
@@ -29,6 +29,11 @@ use super::{Stateful, StatefulInteractiveElement};
 
 /// The delay before showing the loading state.
 pub const LOADING_DELAY: Duration = Duration::from_millis(200);
+
+/// Max number of frames to keep for animated images before falling back to a poster frame.
+pub const MAX_ANIMATED_FRAMES: usize = 120;
+/// Max total decoded bytes to keep for animated images before falling back to a poster frame.
+pub const MAX_ANIMATED_BYTES: usize = 32 * 1024 * 1024;
 
 /// A type alias to the resource loader that the `img()` element uses.
 ///
@@ -222,6 +227,7 @@ impl Img {
     ///
     /// 1. Checking if any ancestor node of the current node contains an `ImageCacheElement`, If such a node exists, the image cache specified by that ancestor will be used.
     /// 2. If no ancestor node contains an `ImageCacheElement`, the global image cache will be used as a fallback.
+    ///    The default global cache is an LRU with a 64MB budget.
     ///
     /// This mechanism provides a flexible way to manage image caching, allowing precise control when needed,
     /// while ensuring a default behavior when no cache is explicitly specified.
@@ -253,12 +259,186 @@ struct ImgState {
     frame_index: usize,
     last_frame_time: Option<Instant>,
     started_loading: Option<(Instant, Task<()>)>,
+    animation_decoder: Option<AnimatedDecoderState>,
 }
 
 /// The image layout state between frames
 pub struct ImgLayoutState {
     frame_index: usize,
     replacement: Option<AnyElement>,
+}
+
+enum AnimatedDecoderState {
+    Gif {
+        image_id: crate::ImageId,
+        bytes: Arc<[u8]>,
+        frames: Frames<'static>,
+        next_index: usize,
+    },
+    WebP {
+        image_id: crate::ImageId,
+        bytes: Arc<[u8]>,
+        frames: Frames<'static>,
+        next_index: usize,
+    },
+}
+
+impl AnimatedDecoderState {
+    fn new(
+        image_id: crate::ImageId,
+        format: ImageFormat,
+        bytes: Arc<[u8]>,
+    ) -> Result<Option<Self>, ImageCacheError> {
+        let frames = match format {
+            ImageFormat::Gif => Self::gif_frames(bytes.clone())?,
+            ImageFormat::WebP => Self::webp_frames(bytes.clone())?,
+            _ => return Ok(None),
+        };
+
+        let decoder = match format {
+            ImageFormat::Gif => AnimatedDecoderState::Gif {
+                image_id,
+                bytes,
+                frames,
+                next_index: 0,
+            },
+            ImageFormat::WebP => AnimatedDecoderState::WebP {
+                image_id,
+                bytes,
+                frames,
+                next_index: 0,
+            },
+            _ => return Ok(None),
+        };
+
+        Ok(Some(decoder))
+    }
+
+    fn image_id(&self) -> crate::ImageId {
+        match self {
+            AnimatedDecoderState::Gif { image_id, .. } => *image_id,
+            AnimatedDecoderState::WebP { image_id, .. } => *image_id,
+        }
+    }
+
+    fn ensure_frame(
+        &mut self,
+        frame_index: usize,
+        data: &RenderImage,
+    ) -> Option<Arc<[u8]>> {
+        if let Some(bytes) = data.bytes(frame_index) {
+            return Some(bytes);
+        }
+
+        let mut attempts = 0;
+        loop {
+            if frame_index < self.next_index() {
+                if self.reset_frames().is_err() {
+                    return None;
+                }
+            }
+
+            while self.next_index() <= frame_index {
+                let next = match self.frames_mut().next() {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(err)) => {
+                        log::debug!("animated frame decode failed: {}", err);
+                        if self.reset_frames().is_err() {
+                            return None;
+                        }
+                        attempts += 1;
+                        break;
+                    }
+                    None => {
+                        if self.reset_frames().is_err() {
+                            return None;
+                        }
+                        attempts += 1;
+                        break;
+                    }
+                };
+
+                let current_index = self.next_index();
+                self.bump_index();
+
+                if current_index != frame_index {
+                    continue;
+                }
+
+                let mut frame = next;
+                for pixel in frame.buffer_mut().chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+                let pixels: Arc<[u8]> =
+                    Arc::from(frame.into_buffer().into_raw().into_boxed_slice());
+                data.cache_frame_pixels(current_index, pixels.clone());
+                return Some(pixels);
+            }
+
+            if attempts > 1 {
+                return None;
+            }
+        }
+    }
+
+    fn next_index(&self) -> usize {
+        match self {
+            AnimatedDecoderState::Gif { next_index, .. } => *next_index,
+            AnimatedDecoderState::WebP { next_index, .. } => *next_index,
+        }
+    }
+
+    fn bump_index(&mut self) {
+        match self {
+            AnimatedDecoderState::Gif { next_index, .. } => *next_index += 1,
+            AnimatedDecoderState::WebP { next_index, .. } => *next_index += 1,
+        }
+    }
+
+    fn frames_mut(&mut self) -> &mut Frames<'static> {
+        match self {
+            AnimatedDecoderState::Gif { frames, .. } => frames,
+            AnimatedDecoderState::WebP { frames, .. } => frames,
+        }
+    }
+
+    fn reset_frames(&mut self) -> Result<(), ImageCacheError> {
+        match self {
+            AnimatedDecoderState::Gif {
+                bytes,
+                frames,
+                next_index,
+                ..
+            } => {
+                *frames = Self::gif_frames(bytes.clone())?;
+                *next_index = 0;
+                Ok(())
+            }
+            AnimatedDecoderState::WebP {
+                bytes,
+                frames,
+                next_index,
+                ..
+            } => {
+                *frames = Self::webp_frames(bytes.clone())?;
+                *next_index = 0;
+                Ok(())
+            }
+        }
+    }
+
+    fn gif_frames(bytes: Arc<[u8]>) -> Result<Frames<'static>, ImageCacheError> {
+        let decoder = GifDecoder::new(Cursor::new(bytes))?;
+        Ok(decoder.into_frames())
+    }
+
+    fn webp_frames(bytes: Arc<[u8]>) -> Result<Frames<'static>, ImageCacheError> {
+        let mut decoder = WebPDecoder::new(Cursor::new(bytes))?;
+        if decoder.has_animation() {
+            let _ = decoder.set_background_color(Rgba([0, 0, 0, 0]));
+        }
+        Ok(decoder.into_frames())
+    }
 }
 
 impl Element for Img {
@@ -291,6 +471,7 @@ impl Element for Img {
                     frame_index: 0,
                     last_frame_time: None,
                     started_loading: None,
+                    animation_decoder: None,
                 })
             });
 
@@ -315,7 +496,24 @@ impl Element for Img {
                             if let Some(state) = &mut state {
                                 let frame_count = data.frame_count();
                                 if frame_count > 1 {
+                                    if let Some((format, bytes)) = data.encoded_source() {
+                                        let needs_new_decoder = state
+                                            .animation_decoder
+                                            .as_ref()
+                                            .map(|decoder| decoder.image_id() != data.id)
+                                            .unwrap_or(true);
+                                        if needs_new_decoder {
+                                            state.animation_decoder =
+                                                AnimatedDecoderState::new(data.id, format, bytes)
+                                                    .ok()
+                                                    .flatten();
+                                        }
+                                    } else {
+                                        state.animation_decoder = None;
+                                    }
+
                                     let current_time = Instant::now();
+                                    let previous_frame = state.frame_index;
                                     if let Some(last_frame_time) = state.last_frame_time {
                                         let elapsed = current_time - last_frame_time;
                                         let frame_duration =
@@ -330,11 +528,29 @@ impl Element for Img {
                                     } else {
                                         state.last_frame_time = Some(current_time);
                                     }
+
+                                    if state.frame_index != previous_frame {
+                                        window
+                                            .drop_image_frame(data.id, previous_frame)
+                                            .log_err();
+                                    }
+
+                                    if let Some(decoder) = &mut state.animation_decoder {
+                                        let _ = decoder.ensure_frame(state.frame_index, &data);
+                                    }
+                                } else {
+                                    state.frame_index = 0;
+                                    state.last_frame_time = None;
+                                    state.animation_decoder = None;
                                 }
                                 state.started_loading = None;
                             }
 
-                            let image_size = data.render_size(frame_index);
+                            let current_frame = state
+                                .as_ref()
+                                .map(|state| state.frame_index)
+                                .unwrap_or(frame_index);
+                            let image_size = data.render_size(current_frame);
                             style.aspect_ratio = Some(image_size.width / image_size.height);
 
                             if let Length::Auto = style.size.width {
@@ -408,7 +624,10 @@ impl Element for Img {
                 },
             );
 
-            layout_state.frame_index = frame_index;
+            layout_state.frame_index = state
+                .as_ref()
+                .map(|state| state.frame_index)
+                .unwrap_or(frame_index);
 
             ((layout_id, layout_state), state)
         })
@@ -636,40 +855,90 @@ impl Asset for ImageAssetLoader {
                 }
             };
 
-            if let Ok(format) = image::guess_format(&bytes) {
-                let data = match format {
-                    ImageFormat::Gif => {
-                        let decoder = GifDecoder::new(Cursor::new(&bytes))?;
-                        let mut frames = SmallVec::new();
+            let bytes: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
 
-                        for frame in decoder.into_frames() {
-                            let mut frame = frame?;
-                            // Convert from RGBA to BGRA.
+            if let Ok(format) = image::guess_format(&bytes) {
+                let mut collect_frames = |mut frames: Frames<'static>| -> Result<(
+                    Vec<(crate::Size<crate::DevicePixels>, image::Delay)>,
+                    Option<Arc<[u8]>>,
+                    bool,
+                ), ImageCacheError> {
+                    let mut metadata = Vec::new();
+                    let mut first_pixels: Option<Arc<[u8]>> = None;
+                    let mut total_bytes: usize = 0;
+                    let mut truncated = false;
+
+                    for frame in frames.by_ref() {
+                        let mut frame = frame?;
+                        let delay = frame.delay();
+                        let buffer_len = frame.buffer().len();
+                        let (width, height) = frame.buffer().dimensions();
+                        let size = size(DevicePixels(width as i32), DevicePixels(height as i32));
+
+                        if metadata.is_empty() {
+                            total_bytes = buffer_len;
                             for pixel in frame.buffer_mut().chunks_exact_mut(4) {
                                 pixel.swap(0, 2);
                             }
-                            frames.push(frame);
+                            let pixels: Arc<[u8]> =
+                                Arc::from(frame.into_buffer().into_raw().into_boxed_slice());
+                            first_pixels = Some(pixels);
+                        } else if metadata.len() + 1 > MAX_ANIMATED_FRAMES
+                            || total_bytes.saturating_add(buffer_len) > MAX_ANIMATED_BYTES
+                        {
+                            truncated = true;
+                            break;
+                        } else {
+                            total_bytes = total_bytes.saturating_add(buffer_len);
                         }
 
-                        frames
+                        metadata.push((size, delay));
+                    }
+
+                    Ok((metadata, first_pixels, truncated))
+                };
+
+                let mut image = match format {
+                    ImageFormat::Gif => {
+                        let decoder = GifDecoder::new(Cursor::new(bytes.clone()))?;
+                        let (mut metadata, first_pixels, truncated) =
+                            collect_frames(decoder.into_frames())?;
+                        if truncated {
+                            metadata.truncate(1);
+                            log::debug!(
+                                "animated gif exceeds limits (max_frames={}, max_bytes={}): using first frame only",
+                                MAX_ANIMATED_FRAMES,
+                                MAX_ANIMATED_BYTES
+                            );
+                        }
+                        let mut image = RenderImage::from_metadata(&metadata, first_pixels);
+                        image = image.with_source(crate::RenderImageSource::Raster {
+                            format,
+                            bytes: bytes.clone(),
+                        });
+                        image
                     }
                     ImageFormat::WebP => {
-                        let mut decoder = WebPDecoder::new(Cursor::new(&bytes))?;
+                        let mut decoder = WebPDecoder::new(Cursor::new(bytes.clone()))?;
 
                         if decoder.has_animation() {
                             let _ = decoder.set_background_color(Rgba([0, 0, 0, 0]));
-                            let mut frames = SmallVec::new();
-
-                            for frame in decoder.into_frames() {
-                                let mut frame = frame?;
-                                // Convert from RGBA to BGRA.
-                                for pixel in frame.buffer_mut().chunks_exact_mut(4) {
-                                    pixel.swap(0, 2);
-                                }
-                                frames.push(frame);
+                            let (mut metadata, first_pixels, truncated) =
+                                collect_frames(decoder.into_frames())?;
+                            if truncated {
+                                metadata.truncate(1);
+                                log::debug!(
+                                    "animated webp exceeds limits (max_frames={}, max_bytes={}): using first frame only",
+                                    MAX_ANIMATED_FRAMES,
+                                    MAX_ANIMATED_BYTES
+                                );
                             }
-
-                            frames
+                            let mut image = RenderImage::from_metadata(&metadata, first_pixels);
+                            image = image.with_source(crate::RenderImageSource::Raster {
+                                format,
+                                bytes: bytes.clone(),
+                            });
+                            image
                         } else {
                             let mut data = DynamicImage::from_decoder(decoder)?.into_rgba8();
 
@@ -678,7 +947,12 @@ impl Asset for ImageAssetLoader {
                                 pixel.swap(0, 2);
                             }
 
-                            SmallVec::from_elem(Frame::new(data), 1)
+                            let mut image = RenderImage::new(SmallVec::from_elem(Frame::new(data), 1));
+                            image = image.with_source(crate::RenderImageSource::Raster {
+                                format,
+                                bytes: bytes.clone(),
+                            });
+                            image
                         }
                     }
                     _ => {
@@ -690,15 +964,52 @@ impl Asset for ImageAssetLoader {
                             pixel.swap(0, 2);
                         }
 
-                        SmallVec::from_elem(Frame::new(data), 1)
+                        let mut image = RenderImage::new(SmallVec::from_elem(Frame::new(data), 1));
+                        image = image.with_source(crate::RenderImageSource::Raster {
+                            format,
+                            bytes: bytes.clone(),
+                        });
+                        image
                     }
                 };
 
-                Ok(Arc::new(RenderImage::new(data)))
+                if log::log_enabled!(log::Level::Debug) {
+                    let frame_count = image.frame_count();
+                    let first_size = image.size(0);
+                    let mut total_pixels_bytes: usize = 0;
+                    for index in 0..frame_count {
+                        let size = image.size(index);
+                        total_pixels_bytes = total_pixels_bytes
+                            .saturating_add(size.width.0 as usize * size.height.0 as usize * 4);
+                    }
+                    log::debug!(
+                        "image decoded: source={:?} format={:?} encoded_bytes={} frames={} first={}x{} est_pixels_bytes={}",
+                        source,
+                        format,
+                        bytes.len(),
+                        frame_count,
+                        first_size.width.0,
+                        first_size.height.0,
+                        total_pixels_bytes
+                    );
+                }
+
+                Ok(Arc::new(image))
             } else {
-                svg_renderer
+                let image = svg_renderer
                     .render_single_frame(&bytes, 1.0, true)
-                    .map_err(Into::into)
+                    .map_err(ImageCacheError::from)?;
+                if log::log_enabled!(log::Level::Debug) {
+                    let size = image.size(0);
+                    log::debug!(
+                        "svg decoded: source={:?} encoded_bytes={} size={}x{}",
+                        source,
+                        bytes.len(),
+                        size.width.0,
+                        size.height.0
+                    );
+                }
+                Ok(image)
             }
         }
     }
