@@ -114,6 +114,7 @@ pub struct WaylandWindowState {
     handle: AnyWindowHandle,
     active: bool,
     hovered: bool,
+    visible: bool,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -387,6 +388,7 @@ impl WaylandWindowState {
             handle,
             active: false,
             hovered: false,
+            visible: options.show,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -566,6 +568,9 @@ impl WaylandWindowStatePtr {
 
     pub fn frame(&self) {
         let mut state = self.state.borrow_mut();
+        if !state.visible {
+            return;
+        }
         state.surface.frame(&state.globals.qh, state.surface.id());
         state.resize_throttle = false;
         drop(state);
@@ -1248,6 +1253,27 @@ impl PlatformWindow for WaylandWindow {
         update_window(state);
     }
 
+    fn hide(&self) {
+        let mut state = self.borrow_mut();
+        if !state.visible {
+            return;
+        }
+        state.visible = false;
+        state.surface.attach(None, 0, 0);
+        state.surface.commit();
+    }
+
+    fn show(&self) {
+        {
+            let mut state = self.borrow_mut();
+            if state.visible {
+                return;
+            }
+            state.visible = true;
+        }
+        self.frame();
+    }
+
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.borrow().background_appearance
     }
@@ -1335,6 +1361,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
+        if !state.visible {
+            return;
+        }
 
         if state.renderer.device_lost() {
             let raw_window = RawWindow {
@@ -1375,6 +1404,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn completed_frame(&self) {
         let state = self.borrow();
+        if !state.visible {
+            return;
+        }
         state.surface.commit();
     }
 

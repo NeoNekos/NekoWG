@@ -40,6 +40,7 @@ pub(crate) struct WebWindowMutableState {
     pub(crate) mouse_position: Point<Pixels>,
     pub(crate) modifiers: Modifiers,
     pub(crate) capslock: Capslock,
+    pub(crate) hidden_display: Option<String>,
 }
 
 pub(crate) struct WebWindowInner {
@@ -148,6 +149,7 @@ impl WebWindow {
             mouse_position: Point::default(),
             modifiers: Modifiers::default(),
             capslock: Capslock::default(),
+            hidden_display: None,
         };
 
         let is_mac = is_mac_platform(&browser_window);
@@ -568,6 +570,31 @@ impl PlatformWindow for WebWindow {
     }
 
     fn set_background_appearance(&self, _background: WindowBackgroundAppearance) {}
+
+    fn hide(&self) {
+        let style = self.inner.canvas.style();
+        let mut state = self.inner.state.borrow_mut();
+        if state.hidden_display.is_some() {
+            return;
+        }
+        let previous = style.get_property_value("display").unwrap_or_default();
+        state.hidden_display = Some(previous);
+        style.set_property("display", "none").ok();
+    }
+
+    fn show(&self) {
+        let style = self.inner.canvas.style();
+        let mut state = self.inner.state.borrow_mut();
+        let Some(previous) = state.hidden_display.take() else {
+            style.remove_property("display").ok();
+            return;
+        };
+        if previous.is_empty() {
+            style.remove_property("display").ok();
+        } else {
+            style.set_property("display", &previous).ok();
+        }
+    }
 
     fn minimize(&self) {
         log::warn!("WebWindow::minimize is not supported in the browser");

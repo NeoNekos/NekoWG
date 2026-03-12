@@ -1406,6 +1406,32 @@ impl PlatformWindow for MacWindow {
             .detach();
     }
 
+    fn hide(&self) {
+        let this = self.0.lock();
+        let window = this.native_window;
+        let executor = this.foreground_executor.clone();
+        executor
+            .spawn(async move {
+                unsafe {
+                    let _: () = msg_send![window, orderOut: nil];
+                }
+            })
+            .detach();
+    }
+
+    fn show(&self) {
+        let this = self.0.lock();
+        let window = this.native_window;
+        let executor = this.foreground_executor.clone();
+        executor
+            .spawn(async move {
+                unsafe {
+                    let _: () = msg_send![window, orderFront: nil];
+                }
+            })
+            .detach();
+    }
+
     fn minimize(&self) {
         let window = self.0.lock().native_window;
         unsafe {

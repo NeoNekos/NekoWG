@@ -248,6 +248,17 @@ impl Render for WindowDemo {
                 )
                 .unwrap();
             }))
+            .child(button("Hide Window (2s)", |window, cx| {
+                window.hide();
+                window
+                    .spawn(cx, async move |cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(2))
+                            .await;
+                        let _ = cx.update(|window, _| window.show());
+                    })
+                    .detach();
+            }))
             .child(button("Hide Application", |window, cx| {
                 cx.hide();
 

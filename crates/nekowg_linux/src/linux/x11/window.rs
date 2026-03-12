@@ -741,7 +741,7 @@ impl X11WindowState {
                 fullscreen: false,
                 maximized_vertical: false,
                 maximized_horizontal: false,
-                hidden: false,
+                hidden: !params.show,
                 appearance,
                 handle,
                 background_appearance: WindowBackgroundAppearance::Opaque,
@@ -1469,6 +1469,9 @@ impl PlatformWindow for X11Window {
     }
 
     fn map_window(&mut self) -> anyhow::Result<()> {
+        if self.0.state.borrow().hidden {
+            return Ok(());
+        }
         check_reply(
             || "X11 MapWindow failed.",
             self.0.xcb.map_window(self.0.x_window),
@@ -1481,6 +1484,32 @@ impl PlatformWindow for X11Window {
         state.background_appearance = background_appearance;
         let transparent = state.is_transparent();
         state.renderer.update_transparency(transparent);
+    }
+
+    fn hide(&self) {
+        {
+            let mut state = self.0.state.borrow_mut();
+            state.hidden = true;
+        }
+        check_reply(
+            || "X11 UnmapWindow failed.",
+            self.0.xcb.unmap_window(self.0.x_window),
+        )
+        .log_err();
+        xcb_flush(&self.0.xcb);
+    }
+
+    fn show(&self) {
+        {
+            let mut state = self.0.state.borrow_mut();
+            state.hidden = false;
+        }
+        check_reply(
+            || "X11 MapWindow failed.",
+            self.0.xcb.map_window(self.0.x_window),
+        )
+        .log_err();
+        xcb_flush(&self.0.xcb);
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {

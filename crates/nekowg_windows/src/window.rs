@@ -831,6 +831,21 @@ impl PlatformWindow for WindowsWindow {
         }
     }
 
+    fn hide(&self) {
+        unsafe { ShowWindowAsync(self.0.hwnd, SW_HIDE).ok().log_err() };
+    }
+
+    fn show(&self) {
+        self.0.set_window_placement().log_err();
+        unsafe {
+            if IsIconic(self.0.hwnd).as_bool() {
+                ShowWindowAsync(self.0.hwnd, SW_RESTORE).ok().log_err();
+            } else {
+                ShowWindowAsync(self.0.hwnd, SW_SHOWNOACTIVATE).ok().log_err();
+            }
+        }
+    }
+
     fn minimize(&self) {
         unsafe { ShowWindowAsync(self.0.hwnd, SW_MINIMIZE).ok().log_err() };
     }

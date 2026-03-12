@@ -4504,6 +4504,16 @@ impl Window {
         self.platform_window.activate();
     }
 
+    /// Hide the current window at the platform level without destroying it.
+    pub fn hide(&self) {
+        self.platform_window.hide();
+    }
+
+    /// Show a previously hidden window at the platform level.
+    pub fn show(&self) {
+        self.platform_window.show();
+    }
+
     /// Minimize the current window at the platform level.
     pub fn minimize_window(&self) {
         self.platform_window.minimize();

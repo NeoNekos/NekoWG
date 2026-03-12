@@ -30,6 +30,7 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    visible: bool,
 }
 
 #[derive(Clone)]
@@ -75,6 +76,7 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            visible: true,
         })))
     }
 
@@ -215,6 +217,14 @@ impl PlatformWindow for TestWindow {
     fn set_app_id(&mut self, _app_id: &str) {}
 
     fn set_background_appearance(&self, _background: WindowBackgroundAppearance) {}
+
+    fn hide(&self) {
+        self.0.lock().visible = false;
+    }
+
+    fn show(&self) {
+        self.0.lock().visible = true;
+    }
 
     fn set_edited(&mut self, edited: bool) {
         self.0.lock().edited = edited;
