@@ -10,6 +10,8 @@ float4 srgb_to_oklab(float4 color);
 float4 oklab_to_srgb(float4 color);
 float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
                           constant Size_DevicePixels *viewport_size);
+float4 to_device_position_with_viewport(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                                        float2 viewport_size);
 float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
                           TransformationMatrix transformation,
                           constant Size_DevicePixels *input_viewport_size);
@@ -886,6 +888,123 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   return ycbcrToRGBTransform * ycbcr;
 }
 
+struct BackdropBlurVertexOutput {
+  float4 position [[position]];
+  float2 uv;
+  uint blur_id [[flat]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropBlurFragmentInput {
+  float4 position [[position]];
+  float2 uv;
+  uint blur_id [[flat]];
+};
+
+vertex BackdropBlurVertexOutput backdrop_blur_vertex(
+    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlurInstance *backdrop_blurs
+    [[buffer(BackdropBlurInputIndex_BackdropBlurs)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  BackdropBlurInstance blur = backdrop_blurs[blur_id];
+  float2 position =
+      unit_vertex * float2(blur.bounds.size.width, blur.bounds.size.height) +
+      float2(blur.bounds.origin.x, blur.bounds.origin.y);
+
+  BackdropBlurVertexOutput output;
+  output.position = to_device_position_with_viewport(unit_vertex, blur.bounds,
+                                                     blur.viewport_size);
+  output.uv = position / blur.viewport_size;
+  output.blur_id = blur_id;
+  float4 clip_distance =
+      distance_from_clip_rect(unit_vertex, blur.bounds, blur.content_mask);
+  output.clip_distance = {clip_distance.x, clip_distance.y, clip_distance.z,
+                          clip_distance.w};
+  return output;
+}
+
+vertex BackdropBlurVertexOutput backdrop_blur_h_vertex(
+    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlurInstance *backdrop_blurs
+    [[buffer(BackdropBlurInputIndex_BackdropBlurs)]]) {
+  return backdrop_blur_vertex(unit_vertex_id, blur_id, unit_vertices,
+                              backdrop_blurs);
+}
+
+vertex BackdropBlurVertexOutput backdrop_blur_composite_vertex(
+    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlurInstance *backdrop_blurs
+    [[buffer(BackdropBlurInputIndex_BackdropBlurs)]]) {
+  return backdrop_blur_vertex(unit_vertex_id, blur_id, unit_vertices,
+                              backdrop_blurs);
+}
+
+vertex BackdropBlurVertexOutput backdrop_blur_blit_vertex(
+    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlurInstance *backdrop_blurs
+    [[buffer(BackdropBlurInputIndex_BackdropBlurs)]]) {
+  return backdrop_blur_vertex(unit_vertex_id, blur_id, unit_vertices,
+                              backdrop_blurs);
+}
+
+float4 gaussian_sample_sum(texture2d<float> input_texture, float2 uv,
+                           float2 dir, float2 step, float4 w0, float4 w1) {
+  constexpr sampler blur_sampler(mag_filter::linear, min_filter::linear);
+  float4 color = input_texture.sample(blur_sampler, uv) * w0.x;
+  float2 offset = dir * step;
+  color += input_texture.sample(blur_sampler, uv + offset) * w0.y;
+  color += input_texture.sample(blur_sampler, uv - offset) * w0.y;
+  color += input_texture.sample(blur_sampler, uv + offset * 2.0) * w0.z;
+  color += input_texture.sample(blur_sampler, uv - offset * 2.0) * w0.z;
+  color += input_texture.sample(blur_sampler, uv + offset * 3.0) * w0.w;
+  color += input_texture.sample(blur_sampler, uv - offset * 3.0) * w0.w;
+  color += input_texture.sample(blur_sampler, uv + offset * 4.0) * w1.x;
+  color += input_texture.sample(blur_sampler, uv - offset * 4.0) * w1.x;
+  return color;
+}
+
+fragment float4 backdrop_blur_h_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlurInstance *backdrop_blurs
+    [[buffer(BackdropBlurInputIndex_BackdropBlurs)]],
+    texture2d<float> input_texture
+    [[texture(BackdropBlurInputIndex_SourceTexture)]]) {
+  BackdropBlurInstance blur = backdrop_blurs[input.blur_id];
+  return gaussian_sample_sum(input_texture, input.uv, blur.direction,
+                             blur.texel_step, blur.weights0, blur.weights1);
+}
+
+fragment float4 backdrop_blur_composite_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlurInstance *backdrop_blurs
+    [[buffer(BackdropBlurInputIndex_BackdropBlurs)]],
+    texture2d<float> input_texture
+    [[texture(BackdropBlurInputIndex_SourceTexture)]]) {
+  BackdropBlurInstance blur = backdrop_blurs[input.blur_id];
+  float4 blurred = gaussian_sample_sum(input_texture, input.uv, blur.direction,
+                                       blur.texel_step, blur.weights0,
+                                       blur.weights1);
+
+  const float antialias_threshold = 0.5;
+  float mask = saturate(antialias_threshold -
+                        quad_sdf(input.position.xy, blur.bounds,
+                                 blur.corner_radii));
+  blurred.a *= mask * blur.opacity;
+  return blurred;
+}
+
+fragment float4 backdrop_blur_blit_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    texture2d<float> input_texture
+    [[texture(BackdropBlurInputIndex_SourceTexture)]]) {
+  constexpr sampler blur_sampler(mag_filter::linear, min_filter::linear);
+  return input_texture.sample(blur_sampler, input.uv);
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;
@@ -991,6 +1110,16 @@ float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
       float2(bounds.origin.x, bounds.origin.y);
   float2 viewport_size = float2((float)input_viewport_size->width,
                                 (float)input_viewport_size->height);
+  float2 device_position =
+      position / viewport_size * float2(2., -2.) + float2(-1., 1.);
+  return float4(device_position, 0., 1.);
+}
+
+float4 to_device_position_with_viewport(float2 unit_vertex, Bounds_ScaledPixels bounds,
+                                        float2 viewport_size) {
+  float2 position =
+      unit_vertex * float2(bounds.size.width, bounds.size.height) +
+      float2(bounds.origin.x, bounds.origin.y);
   float2 device_position =
       position / viewport_size * float2(2., -2.) + float2(-1., 1.);
   return float4(device_position, 0., 1.);

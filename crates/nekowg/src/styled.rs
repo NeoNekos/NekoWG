@@ -646,6 +646,54 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Applies a backdrop blur with a custom radius.
+    /// [Docs](https://tailwindcss.com/docs/backdrop-blur)
+    fn backdrop_blur(mut self, radius: impl Into<AbsoluteLength>) -> Self {
+        self.style().backdrop_blur = Some(radius.into());
+        self
+    }
+
+    /// Disables backdrop blur explicitly (sets radius to 0).
+    fn backdrop_blur_none(mut self) -> Self {
+        self.style().backdrop_blur = Some(AbsoluteLength::default());
+        self
+    }
+
+    /// `backdrop-blur-xs` — 4px.
+    fn backdrop_blur_xs(self) -> Self {
+        self.backdrop_blur(px(4.0))
+    }
+
+    /// `backdrop-blur-sm` — 8px.
+    fn backdrop_blur_sm(self) -> Self {
+        self.backdrop_blur(px(8.0))
+    }
+
+    /// `backdrop-blur-md` — 12px.
+    fn backdrop_blur_md(self) -> Self {
+        self.backdrop_blur(px(12.0))
+    }
+
+    /// `backdrop-blur-lg` — 16px.
+    fn backdrop_blur_lg(self) -> Self {
+        self.backdrop_blur(px(16.0))
+    }
+
+    /// `backdrop-blur-xl` — 24px.
+    fn backdrop_blur_xl(self) -> Self {
+        self.backdrop_blur(px(24.0))
+    }
+
+    /// `backdrop-blur-2xl` — 40px.
+    fn backdrop_blur_2xl(self) -> Self {
+        self.backdrop_blur(px(40.0))
+    }
+
+    /// `backdrop-blur-3xl` — 64px.
+    fn backdrop_blur_3xl(self) -> Self {
+        self.backdrop_blur(px(64.0))
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(cols);

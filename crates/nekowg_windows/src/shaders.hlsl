@@ -101,6 +101,12 @@ float4 to_device_position(float2 unit_vertex, Bounds bounds) {
     return to_device_position_impl(position);
 }
 
+float4 to_device_position_with_viewport(float2 unit_vertex, Bounds bounds, float2 viewport_size) {
+    float2 position = unit_vertex * bounds.size + bounds.origin;
+    float2 device_position = position / viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    return float4(device_position, 0.0, 1.0);
+}
+
 float4 distance_from_clip_rect_impl(float2 position, Bounds clip_bounds) {
     float2 tl = position - clip_bounds.origin;
     float2 br = clip_bounds.origin + clip_bounds.size - position;
@@ -903,6 +909,99 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
     }
 
     return input.color * float4(1., 1., 1., alpha);
+}
+
+/*
+**
+**              Backdrop Blur
+**
+*/
+
+struct BackdropBlur {
+    Bounds bounds;
+    Bounds content_mask;
+    Corners corner_radii;
+    float opacity;
+    float3 _pad0;
+    float2 direction;
+    float2 texel_step;
+    float2 viewport_size;
+    float2 _pad1;
+    float4 weights0;
+    float4 weights1;
+};
+
+struct BackdropBlurVertexOutput {
+    nointerpolation uint blur_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 uv: TEXCOORD1;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct BackdropBlurFragmentInput {
+    nointerpolation uint blur_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 uv: TEXCOORD1;
+};
+
+StructuredBuffer<BackdropBlur> backdrop_blurs: register(t1);
+
+BackdropBlurVertexOutput backdrop_blur_vertex(uint vertex_id: SV_VertexID, uint blur_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    BackdropBlur blur = backdrop_blurs[blur_id];
+    float2 position = unit_vertex * blur.bounds.size + blur.bounds.origin;
+
+    BackdropBlurVertexOutput output;
+    output.position = to_device_position_with_viewport(unit_vertex, blur.bounds, blur.viewport_size);
+    output.uv = position / blur.viewport_size;
+    output.blur_id = blur_id;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, blur.bounds, blur.content_mask);
+    return output;
+}
+
+BackdropBlurVertexOutput backdrop_blur_h_vertex(uint vertex_id: SV_VertexID, uint blur_id: SV_InstanceID) {
+    return backdrop_blur_vertex(vertex_id, blur_id);
+}
+
+BackdropBlurVertexOutput backdrop_blur_composite_vertex(uint vertex_id: SV_VertexID, uint blur_id: SV_InstanceID) {
+    return backdrop_blur_vertex(vertex_id, blur_id);
+}
+
+BackdropBlurVertexOutput backdrop_blur_blit_vertex(uint vertex_id: SV_VertexID, uint blur_id: SV_InstanceID) {
+    return backdrop_blur_vertex(vertex_id, blur_id);
+}
+
+float4 gaussian_sample_sum(float2 uv, float2 dir, float2 step, float4 w0, float4 w1) {
+    float4 color = t_sprite.Sample(s_sprite, uv) * w0.x;
+    float2 offset = dir * step;
+    color += t_sprite.Sample(s_sprite, uv + offset) * w0.y;
+    color += t_sprite.Sample(s_sprite, uv - offset) * w0.y;
+    color += t_sprite.Sample(s_sprite, uv + offset * 2.0) * w0.z;
+    color += t_sprite.Sample(s_sprite, uv - offset * 2.0) * w0.z;
+    color += t_sprite.Sample(s_sprite, uv + offset * 3.0) * w0.w;
+    color += t_sprite.Sample(s_sprite, uv - offset * 3.0) * w0.w;
+    color += t_sprite.Sample(s_sprite, uv + offset * 4.0) * w1.x;
+    color += t_sprite.Sample(s_sprite, uv - offset * 4.0) * w1.x;
+    return color;
+}
+
+float4 backdrop_blur_h_fragment(BackdropBlurFragmentInput input): SV_TARGET {
+    BackdropBlur blur = backdrop_blurs[input.blur_id];
+    return gaussian_sample_sum(input.uv, blur.direction, blur.texel_step, blur.weights0, blur.weights1);
+}
+
+float4 backdrop_blur_composite_fragment(BackdropBlurFragmentInput input): SV_TARGET {
+    BackdropBlur blur = backdrop_blurs[input.blur_id];
+    float4 blurred = gaussian_sample_sum(input.uv, blur.direction, blur.texel_step, blur.weights0, blur.weights1);
+
+    const float antialias_threshold = 0.5;
+    float mask = saturate(antialias_threshold - quad_sdf(input.position.xy, blur.bounds, blur.corner_radii));
+    blurred.a *= mask * blur.opacity;
+    return blurred;
+}
+
+float4 backdrop_blur_blit_fragment(BackdropBlurFragmentInput input): SV_TARGET {
+    return t_sprite.Sample(s_sprite, input.uv);
 }
 
 /*

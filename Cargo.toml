@@ -27,6 +27,7 @@ default-members = ["crates/nekowg"]
 
 [workspace.package]
 publish = false
+version = "0.2.21"
 edition = "2024"
 
 [workspace.dependencies]
@@ -61,10 +62,6 @@ util_macros = { path = "crates/util_macros" }
 # External crates
 #
 
-agent-client-protocol = { version = "=0.9.4", features = ["unstable"] }
-aho-corasick = "1.1"
-alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "9d9640d4" }
-any_vec = "0.14"
 anyhow = "1.0.86"
 arrayvec = { version = "0.7.4", features = ["serde"] }
 ashpd = { version = "0.13", default-features = false, features = [
@@ -73,57 +70,24 @@ ashpd = { version = "0.13", default-features = false, features = [
     "open_uri",
     "file_chooser",
     "settings",
-    "trash"
+    "trash",
 ] }
 async-channel = "2.5.0"
-async-compat = "0.2.1"
-async-compression = { version = "0.4", features = ["gzip", "futures-io"] }
-async-dispatcher = "0.1"
 async-fs = "2.1"
-async-lock = "2.1"
-async-pipe = { git = "https://github.com/zed-industries/async-pipe-rs", rev = "82d00a04211cf4e1236029aa03e6b6ce2a74c553" }
-async-recursion = "1.0.0"
-async-tar = "0.5.1"
 async-task = "4.7"
-async-trait = "0.1"
-async-tungstenite = "0.31.0"
 async_zip = { version = "0.0.18", features = ["deflate", "deflate64"] }
-aws-config = { version = "1.8.10", features = ["behavior-version-latest"] }
-aws-credential-types = { version = "1.2.8", features = [
-    "hardcoded-credentials",
-] }
-aws-sdk-bedrockruntime = { version = "1.112.0", features = [
-    "behavior-version-latest",
-] }
-aws-smithy-runtime-api = { version = "1.9.2", features = ["http-1x", "client"] }
-aws-smithy-types = { version = "1.3.4", features = ["http-body-1-x"] }
 backtrace = "0.3"
-base64 = "0.22"
-bincode = "1.2.1"
 bitflags = "2.6.0"
-brotli = "8.0.2"
 bytes = "1.0"
-cargo_metadata = "0.19"
-cargo_toml = "0.21"
-brush-parser = "0.3"
-cfg-if = "1.0.3"
-chardetng = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
-ciborium = "0.2"
 circular-buffer = "1.0"
-clap = { version = "4.4", features = ["derive", "wrap_help"] }
 cocoa = "=0.26.0"
 cocoa-foundation = "=0.2.0"
-convert_case = "0.8.0"
 core-foundation = "=0.10.0"
 core-foundation-sys = "0.8.6"
 core-video = { version = "0.5.2", features = ["metal"] }
-cpal = "0.17"
-crash-handler = "0.6"
-criterion = { version = "0.5", features = ["html_reports"] }
 ctor = "0.4.0"
-dap-types = { git = "https://github.com/zed-industries/dap-types", rev = "1b461b310481d01e02b2603c16d7144b926339f8" }
-dashmap = "6.0"
+dirs = "4.0"
 derive_more = { version = "2.1.1", features = [
     "add",
     "add_assign",
@@ -134,60 +98,27 @@ derive_more = { version = "2.1.1", features = [
     "mul_assign",
     "not",
 ] }
-dirs = "4.0"
-documented = "0.9.1"
-dotenvy = "0.15.0"
-ec4rs = "1.1"
-emojis = "0.6.1"
 env_logger = "0.11"
-encoding_rs = "0.8"
-exec = "0.3.1"
-fancy-regex = "0.16.0"
-fork = "0.4.0"
 futures = "0.3"
-futures-concurrency = "7.7.1"
 futures-lite = "1.13"
-gh-workflow = { git = "https://github.com/zed-industries/gh-workflow", rev = "c9eac0ed361583e1072860d96776fa52775b82ac" }
-git2 = { version = "0.20.1", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.20.1", default-features = false, features = [
+    "vendored-libgit2",
+] }
 globset = "0.4"
-handlebars = "4.3"
 heck = "0.5"
-heed = { version = "0.21.0", features = ["read-txn-no-tls"] }
-hex = "0.4.3"
-human_bytes = "0.4.1"
-html5ever = "0.27.0"
 http = "1.1"
 http-body = "1.0"
-hyper = "0.14"
-ignore = "0.4.22"
 image = "0.25.1"
-imara-diff = "0.1.8"
 indexmap = { version = "2.7.0", features = ["serde"] }
 indoc = "2"
 inventory = "0.3.19"
 itertools = "0.14.0"
-json_dotpath = "1.1"
-jsonschema = "0.37.0"
-jsonwebtoken = "10.0"
-jupyter-protocol = "1.4.0"
-jupyter-websocket-client = "1.0.0"
 libc = "0.2"
-libsqlite3-sys = { version = "0.30.1", features = ["bundled"] }
-linkify = "0.10.0"
-libwebrtc = "0.3.26"
-livekit = { version = "0.7.32", features = ["tokio", "rustls-tls-native-roots"] }
 log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
-lsp-types = { git = "https://github.com/zed-industries/lsp-types", rev = "a4f410987660bf560d1e617cb78117c6b6b9f599" }
 mach2 = "0.5"
-markup5ever_rcdom = "0.3.0"
 metal = "0.33"
-minidumper = "0.9"
-moka = { version = "0.12.10", features = ["sync"] }
 naga = { version = "28.0", features = ["wgsl-in"] }
-nanoid = "0.4"
-nbformat = "1.2.0"
 nix = "0.29"
-num-format = "0.4.4"
 objc = "0.2"
 objc2-foundation = { version = "=0.3.1", default-features = false, features = [
     "NSArray",
@@ -214,35 +145,16 @@ objc2-foundation = { version = "=0.3.1", default-features = false, features = [
     "objc2-core-foundation",
     "std",
 ] }
-open = "5.0.0"
-ordered-float = "2.1.1"
-palette = { version = "0.7.5", default-features = false, features = ["std"] }
 parking_lot = "0.12.1"
-partial-json-fixer = "0.5.3"
-parse_int = "0.9"
-pciid-parser = "0.8.0"
-pathdiff = "0.2"
 percent-encoding = "2.3.2"
-pet = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "d5b5bb0c4558a51d8cc76b514bc870fd1c042f16" }
-pet-conda = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "d5b5bb0c4558a51d8cc76b514bc870fd1c042f16" }
-pet-core = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "d5b5bb0c4558a51d8cc76b514bc870fd1c042f16" }
-pet-fs = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "d5b5bb0c4558a51d8cc76b514bc870fd1c042f16" }
-pet-poetry = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "d5b5bb0c4558a51d8cc76b514bc870fd1c042f16" }
-pet-reporter = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "d5b5bb0c4558a51d8cc76b514bc870fd1c042f16" }
-pet-virtualenv = { git = "https://github.com/microsoft/python-environment-tools.git", rev = "d5b5bb0c4558a51d8cc76b514bc870fd1c042f16" }
-portable-pty = "0.9.0"
-postage = { version = "0.5", features = ["futures-traits"] }
 pretty_assertions = { version = "1.3.0", features = ["unstable"] }
 proc-macro2 = "1.0.93"
 profiling = "1"
 # replace this with main when #635 is merged
-proptest = { git = "https://github.com/proptest-rs/proptest", rev = "3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b", features = ["attr-macro"] }
-proptest-derive = "0.8.0"
-prost = "0.9"
-prost-build = "0.9"
-prost-types = "0.9"
+proptest = { git = "https://github.com/proptest-rs/proptest", rev = "3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b", features = [
+    "attr-macro",
+] }
 pollster = "0.4.0"
-pulldown-cmark = { version = "0.13.0", default-features = false }
 quote = "1.0.9"
 rand = "0.9"
 rayon = "1.8"
@@ -257,12 +169,8 @@ reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "c15662
     "socks",
     "stream",
 ], package = "zed-reqwest", version = "0.12.15-zed" }
-rsa = "0.9.6"
-runtimelib = { version = "1.4.0", default-features = false, features = [
-    "async-dispatcher-runtime", "aws-lc-rs"
-] }
-rust-embed = { version = "8.4", features = ["include-exclude"] }
 rustc-hash = "2.1.0"
+rust-embed = { version = "8.4", features = ["include-exclude"] }
 rustls = { version = "0.23.26" }
 rustls-platform-verifier = "0.5.0"
 # WARNING: If you change this, you must also publish a new version of zed-scap to crates.io
@@ -275,105 +183,29 @@ serde_json_lenient = { version = "0.2", features = [
     "preserve_order",
     "raw_value",
 ] }
-serde_path_to_error = "0.1.17"
-serde_repr = "0.1"
 serde_urlencoded = "0.7"
-sha2 = "0.10"
-shellexpand = "2.1.0"
 shlex = "1.3.0"
-simplelog = "0.12.2"
 slotmap = "1.0.6"
 smallvec = { version = "1.6", features = ["union", "const_new"] }
 smol = "2.0"
-sqlformat = "0.2"
 stacksafe = "0.1"
-streaming-iterator = "0.1"
-strsim = "0.11"
 strum = { version = "0.27.2", features = ["derive"] }
 syn = { version = "2.0.101", features = ["full", "extra-traits", "visit-mut"] }
-sys-locale = "0.3.1"
-sysinfo = "0.37.0"
 take-until = "0.2.0"
 tempfile = "3.20.0"
 thiserror = "2.0.12"
-tiktoken-rs = { git = "https://github.com/zed-industries/tiktoken-rs", rev = "2570c4387a8505fb8f1d3f3557454b474f1e8271" }
-time = { version = "0.3", features = [
-    "macros",
-    "parsing",
-    "serde",
-    "serde-well-known",
-    "formatting",
-    "local-offset",
-] }
-tiny_http = "0.8"
 tokio = { version = "1" }
-tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
-tokio-socks = { version = "0.5.2", default-features = false, features = [
-    "futures-io",
-    "tokio",
-] }
-toml = "0.8"
-toml_edit = { version = "0.22", default-features = false, features = [
-    "display",
-    "parse",
-    "serde",
-] }
-tower-http = "0.4.4"
-tree-sitter = { version = "0.26", features = ["wasm"] }
-tree-sitter-bash = "0.25.1"
-tree-sitter-c = "0.24.1"
-tree-sitter-cpp = { git = "https://github.com/tree-sitter/tree-sitter-cpp", rev = "5cb9b693cfd7bfacab1d9ff4acac1a4150700609" }
-tree-sitter-css = "0.23"
-tree-sitter-diff = "0.1.0"
-tree-sitter-elixir = "0.3"
-tree-sitter-embedded-template = "0.23.0"
-tree-sitter-gitcommit = { git = "https://github.com/zed-industries/tree-sitter-git-commit", rev = "88309716a69dd13ab83443721ba6e0b491d37ee9" }
-tree-sitter-go = "0.25"
-tree-sitter-go-mod = { git = "https://github.com/camdencheek/tree-sitter-go-mod", rev = "2e886870578eeba1927a2dc4bd2e2b3f598c5f9a", package = "tree-sitter-gomod" }
-tree-sitter-gowork = { git = "https://github.com/zed-industries/tree-sitter-go-work", rev = "acb0617bf7f4fda02c6217676cc64acb89536dc7" }
-tree-sitter-heex = { git = "https://github.com/zed-industries/tree-sitter-heex", rev = "1dd45142fbb05562e35b2040c6129c9bca346592" }
-tree-sitter-html = "0.23"
-tree-sitter-jsdoc = "0.23"
-tree-sitter-json = "0.24"
-tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
-tree-sitter-python = "0.25"
-tree-sitter-regex = "0.24"
-tree-sitter-ruby = "0.23"
-tree-sitter-rust = "0.24"
-tree-sitter-typescript = { git = "https://github.com/zed-industries/tree-sitter-typescript", rev = "e2c53597d6a5d9cf7bbe8dccde576fe1e46c5899" } # https://github.com/tree-sitter/tree-sitter-typescript/pull/347
-tree-sitter-yaml = { git = "https://github.com/zed-industries/tree-sitter-yaml", rev = "baff0b51c64ef6a1fb1f8390f3ad6015b83ec13a" }
-tracing = "0.1.40"
 unicase = "2.6"
-unicode-script = "0.5.7"
 unicode-segmentation = "1.10"
 unicode-width = "0.2"
-unindent = "0.2.0"
 url = "2.2"
-urlencoding = "2.1.2"
 uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }
 walkdir = "2.5"
-wasm-encoder = "0.221"
-wasmparser = "0.221"
-wasmtime = { version = "33", default-features = false, features = [
-    "async",
-    "demangle",
-    "runtime",
-    "cranelift",
-    "component-model",
-    "incremental-cache",
-    "parallel-compilation",
-] }
-wasmtime-wasi = "33"
-wax = "0.7"
 which = "6.0.0"
 wasm-bindgen = "0.2.113"
 web-time = "1.1.0"
 wgpu = { git = "https://github.com/zed-industries/wgpu", rev = "465557eccfe77c840a9b4936f1408da9503372c4" }
 windows-core = "0.61"
-yawc = "0.2.5"
-zeroize = "1.8"
-zstd = "0.11"
-
 
 [workspace.dependencies.windows]
 version = "0.61"
@@ -432,12 +264,6 @@ features = [
 
 [patch.crates-io]
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
-notify = { git = "https://github.com/zed-industries/notify.git", rev = "ce58c24cad542c28e04ced02e20325a4ec28a31d" }
-notify-types = { git = "https://github.com/zed-industries/notify.git", rev = "ce58c24cad542c28e04ced02e20325a4ec28a31d" }
-windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
-calloop = { git = "https://github.com/zed-industries/calloop" }
-livekit = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "37835f840d0070d45ac8b31cce6a6ae7aca3f459" }
-libwebrtc = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "37835f840d0070d45ac8b31cce6a6ae7aca3f459" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
@@ -455,9 +281,6 @@ debug = true
 # proc-macros start
 nekowg_macros = { opt-level = 3 }
 derive_refineable = { opt-level = 3 }
-settings_macros = { opt-level = 3 }
-sqlez_macros = { opt-level = 3, codegen-units = 1 }
-ui_macros = { opt-level = 3 }
 util_macros = { opt-level = 3 }
 quote = { opt-level = 3 }
 syn = { opt-level = 3 }
@@ -465,51 +288,11 @@ proc-macro2 = { opt-level = 3 }
 # proc-macros end
 
 taffy = { opt-level = 3 }
-resvg = { opt-level = 3 }
-wasmtime = { opt-level = 3 }
-# Build single-source-file crates with cg=1 as it helps make `cargo build` of a whole workspace a bit faster
-activity_indicator = { codegen-units = 1 }
-assets = { codegen-units = 1 }
-breadcrumbs = { codegen-units = 1 }
-collections = { codegen-units = 1 }
-command_palette = { codegen-units = 1 }
-command_palette_hooks = { codegen-units = 1 }
-feature_flags = { codegen-units = 1 }
-file_icons = { codegen-units = 1 }
-image_viewer = { codegen-units = 1 }
-edit_prediction_ui = { codegen-units = 1 }
-install_cli = { codegen-units = 1 }
-journal = { codegen-units = 1 }
-json_schema_store = { codegen-units = 1 }
-lmstudio = { codegen-units = 1 }
-menu = { codegen-units = 1 }
-notifications = { codegen-units = 1 }
-ollama = { codegen-units = 1 }
-outline = { codegen-units = 1 }
-paths = { codegen-units = 1 }
-prettier = { codegen-units = 1 }
-project_symbols = { codegen-units = 1 }
-refineable = { codegen-units = 1 }
-release_channel = { codegen-units = 1 }
-reqwest_client = { codegen-units = 1 }
-session = { codegen-units = 1 }
-sidebar = { codegen-units = 1 }
-snippet = { codegen-units = 1 }
-snippets_ui = { codegen-units = 1 }
-story = { codegen-units = 1 }
-telemetry_events = { codegen-units = 1 }
-theme_selector = { codegen-units = 1 }
-time_format = { codegen-units = 1 }
-ui_input = { codegen-units = 1 }
-zed_actions = { codegen-units = 1 }
 
 [profile.release]
 debug = "limited"
 lto = "thin"
 codegen-units = 1
-
-[profile.release.package]
-zed = { codegen-units = 16 }
 
 [profile.release-fast]
 inherits = "release"

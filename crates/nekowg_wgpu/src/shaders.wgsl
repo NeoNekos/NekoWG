@@ -176,6 +176,12 @@ fn to_device_position(unit_vertex: vec2<f32>, bounds: Bounds) -> vec4<f32> {
     return to_device_position_impl(position);
 }
 
+fn to_device_position_with_viewport(unit_vertex: vec2<f32>, bounds: Bounds, viewport_size: vec2<f32>) -> vec4<f32> {
+    let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
+    let device_position = position / viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
+    return vec4<f32>(device_position, 0.0, 1.0);
+}
+
 fn to_device_position_transformed(unit_vertex: vec2<f32>, bounds: Bounds, transform: TransformationMatrix) -> vec4<f32> {
     let position = unit_vertex * vec2<f32>(bounds.size) + bounds.origin;
     //Note: Rust side stores it as row-major, so transposing here
@@ -1016,6 +1022,87 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     }
 
     return blend_color(input.color, alpha);
+}
+
+// --- backdrop blur --- //
+
+struct BackdropBlur {
+    bounds: Bounds,
+    content_mask: Bounds,
+    corner_radii: Corners,
+    opacity: f32,
+    _pad0: vec3<f32>,
+    direction: vec2<f32>,
+    texel_step: vec2<f32>,
+    viewport_size: vec2<f32>,
+    _pad1: vec2<f32>,
+    weights0: vec4<f32>,
+    weights1: vec4<f32>,
+}
+@group(1) @binding(0) var<storage, read> b_backdrop_blurs: array<BackdropBlur>;
+
+struct BackdropBlurVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) blur_id: u32,
+    //TODO: use `clip_distance` once Naga supports it
+    @location(2) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_backdrop_blur(
+    @builtin(vertex_index) vertex_id: u32,
+    @builtin(instance_index) instance_id: u32
+) -> BackdropBlurVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let blur = b_backdrop_blurs[instance_id];
+    let position = unit_vertex * vec2<f32>(blur.bounds.size) + blur.bounds.origin;
+
+    var out = BackdropBlurVarying();
+    out.position = to_device_position_with_viewport(unit_vertex, blur.bounds, blur.viewport_size);
+    out.uv = position / blur.viewport_size;
+    out.blur_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, blur.bounds, blur.content_mask);
+    return out;
+}
+
+fn gaussian_sample_sum(uv: vec2<f32>, dir: vec2<f32>, step: vec2<f32>, weights0: vec4<f32>, weights1: vec4<f32>) -> vec4<f32> {
+    var color = textureSample(t_sprite, s_sprite, uv) * weights0.x;
+    let offset = dir * step;
+    color += textureSample(t_sprite, s_sprite, uv + offset) * weights0.y;
+    color += textureSample(t_sprite, s_sprite, uv - offset) * weights0.y;
+    color += textureSample(t_sprite, s_sprite, uv + offset * 2.0) * weights0.z;
+    color += textureSample(t_sprite, s_sprite, uv - offset * 2.0) * weights0.z;
+    color += textureSample(t_sprite, s_sprite, uv + offset * 3.0) * weights0.w;
+    color += textureSample(t_sprite, s_sprite, uv - offset * 3.0) * weights0.w;
+    color += textureSample(t_sprite, s_sprite, uv + offset * 4.0) * weights1.x;
+    color += textureSample(t_sprite, s_sprite, uv - offset * 4.0) * weights1.x;
+    return color;
+}
+
+@fragment
+fn fs_backdrop_blur_h(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
+    let blur = b_backdrop_blurs[input.blur_id];
+    return gaussian_sample_sum(input.uv, blur.direction, blur.texel_step, blur.weights0, blur.weights1);
+}
+
+@fragment
+fn fs_backdrop_blur_composite(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let blur = b_backdrop_blurs[input.blur_id];
+    let blurred = gaussian_sample_sum(input.uv, blur.direction, blur.texel_step, blur.weights0, blur.weights1);
+
+    let antialias_threshold = 0.5;
+    let mask = saturate(antialias_threshold - quad_sdf(input.position.xy, blur.bounds, blur.corner_radii));
+    return blend_color(blurred, mask * blur.opacity);
+}
+
+@fragment
+fn fs_backdrop_blur_blit(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
+    return textureSample(t_sprite, s_sprite, input.uv);
 }
 
 // --- path rasterization --- //

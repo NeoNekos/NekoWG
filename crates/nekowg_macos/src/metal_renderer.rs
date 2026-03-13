@@ -9,9 +9,9 @@ use cocoa::{
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 use nekowg::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    AtlasTextureId, BackdropFilter, Background, Bounds, ContentMask, Corners, DevicePixels,
+    MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
+    ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
 };
 
 use core_foundation::base::TCFType;
@@ -120,6 +120,9 @@ pub(crate) struct MetalRenderer {
     shadows_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
+    backdrop_blur_h_pipeline_state: metal::RenderPipelineState,
+    backdrop_blur_composite_pipeline_state: metal::RenderPipelineState,
+    backdrop_blur_blit_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
@@ -130,6 +133,12 @@ pub(crate) struct MetalRenderer {
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
+    backdrop_main_texture: Option<metal::Texture>,
+    backdrop_temp_texture: Option<metal::Texture>,
+    backdrop_down2_texture: Option<metal::Texture>,
+    backdrop_temp2_texture: Option<metal::Texture>,
+    backdrop_down4_texture: Option<metal::Texture>,
+    backdrop_temp4_texture: Option<metal::Texture>,
     path_sample_count: u32,
 }
 
@@ -139,6 +148,64 @@ pub struct PathRasterizationVertex {
     pub st_position: Point<f32>,
     pub color: Background,
     pub bounds: Bounds<ScaledPixels>,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct BackdropBlurInstance {
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: Bounds<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub opacity: f32,
+    pub _pad0: [f32; 3],
+    pub direction: [f32; 2],
+    pub texel_step: [f32; 2],
+    pub viewport_size: [f32; 2],
+    pub _pad1: [f32; 2],
+    pub weights0: [f32; 4],
+    pub weights1: [f32; 4],
+}
+
+impl BackdropBlurInstance {
+    fn blur_instance(
+        bounds: Bounds<ScaledPixels>,
+        content_mask: Bounds<ScaledPixels>,
+        corner_radii: Corners<ScaledPixels>,
+        opacity: f32,
+        direction: [f32; 2],
+        texel_step: [f32; 2],
+        viewport_size: [f32; 2],
+        weights0: [f32; 4],
+        weights1: [f32; 4],
+    ) -> Self {
+        Self {
+            bounds,
+            content_mask,
+            corner_radii,
+            opacity,
+            _pad0: [0.0; 3],
+            direction,
+            texel_step,
+            viewport_size,
+            _pad1: [0.0; 2],
+            weights0,
+            weights1,
+        }
+    }
+
+    fn blit_instance(bounds: Bounds<ScaledPixels>, viewport_size: [f32; 2]) -> Self {
+        Self::blur_instance(
+            bounds,
+            bounds,
+            Corners::default(),
+            1.0,
+            [1.0, 0.0],
+            [0.0, 0.0],
+            viewport_size,
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        )
+    }
 }
 
 impl MetalRenderer {
@@ -291,6 +358,30 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let backdrop_blur_h_pipeline_state = build_pipeline_state_no_blend(
+            &device,
+            &library,
+            "backdrop_blur_h",
+            "backdrop_blur_h_vertex",
+            "backdrop_blur_h_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let backdrop_blur_composite_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "backdrop_blur_composite",
+            "backdrop_blur_composite_vertex",
+            "backdrop_blur_composite_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let backdrop_blur_blit_pipeline_state = build_pipeline_state_no_blend(
+            &device,
+            &library,
+            "backdrop_blur_blit",
+            "backdrop_blur_blit_vertex",
+            "backdrop_blur_blit_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -309,6 +400,9 @@ impl MetalRenderer {
             shadows_pipeline_state,
             quads_pipeline_state,
             underlines_pipeline_state,
+            backdrop_blur_h_pipeline_state,
+            backdrop_blur_composite_pipeline_state,
+            backdrop_blur_blit_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
@@ -318,6 +412,12 @@ impl MetalRenderer {
             core_video_texture_cache,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
+            backdrop_main_texture: None,
+            backdrop_temp_texture: None,
+            backdrop_down2_texture: None,
+            backdrop_temp2_texture: None,
+            backdrop_down4_texture: None,
+            backdrop_temp4_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
         }
     }
@@ -356,6 +456,7 @@ impl MetalRenderer {
             height: DevicePixels(size.height as i32),
         };
         self.update_path_intermediate_textures(device_pixels_size);
+        self.invalidate_backdrop_textures();
     }
 
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -394,6 +495,73 @@ impl MetalRenderer {
         } else {
             self.path_intermediate_msaa_texture = None;
         }
+    }
+
+    fn invalidate_backdrop_textures(&mut self) {
+        self.backdrop_main_texture = None;
+        self.backdrop_temp_texture = None;
+        self.backdrop_down2_texture = None;
+        self.backdrop_temp2_texture = None;
+        self.backdrop_down4_texture = None;
+        self.backdrop_temp4_texture = None;
+    }
+
+    fn ensure_backdrop_textures(&mut self, size: Size<DevicePixels>) -> bool {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.invalidate_backdrop_textures();
+            return false;
+        }
+
+        let width = size.width.0 as u64;
+        let height = size.height.0 as u64;
+        let needs_recreate = self
+            .backdrop_main_texture
+            .as_ref()
+            .map_or(true, |texture| {
+                texture.width() != width || texture.height() != height
+            });
+
+        if !needs_recreate {
+            return true;
+        }
+
+        let down2 = Size {
+            width: DevicePixels(((size.width.0 + 1) / 2).max(1)),
+            height: DevicePixels(((size.height.0 + 1) / 2).max(1)),
+        };
+        let down4 = Size {
+            width: DevicePixels(((size.width.0 + 3) / 4).max(1)),
+            height: DevicePixels(((size.height.0 + 3) / 4).max(1)),
+        };
+
+        self.backdrop_main_texture =
+            Some(self.create_backdrop_texture(size, "backdrop_main"));
+        self.backdrop_temp_texture =
+            Some(self.create_backdrop_texture(size, "backdrop_temp"));
+        self.backdrop_down2_texture =
+            Some(self.create_backdrop_texture(down2, "backdrop_down2"));
+        self.backdrop_temp2_texture =
+            Some(self.create_backdrop_texture(down2, "backdrop_temp2"));
+        self.backdrop_down4_texture =
+            Some(self.create_backdrop_texture(down4, "backdrop_down4"));
+        self.backdrop_temp4_texture =
+            Some(self.create_backdrop_texture(down4, "backdrop_temp4"));
+
+        true
+    }
+
+    fn create_backdrop_texture(&self, size: Size<DevicePixels>, label: &str) -> metal::Texture {
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(size.width.0.max(1) as u64);
+        texture_descriptor.set_height(size.height.0.max(1) as u64);
+        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        texture_descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+
+        let texture = self.device.new_texture(&texture_descriptor);
+        texture.set_label(label);
+        texture
     }
 
     pub fn update_transparency(&self, transparent: bool) {
@@ -578,16 +746,43 @@ impl MetalRenderer {
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.layer.is_opaque() { 1. } else { 0. };
         let mut instance_offset = 0;
+        let use_backdrop = !scene.backdrop_filters.is_empty();
 
-        let mut command_encoder = new_command_encoder(
-            command_buffer,
-            drawable,
-            viewport_size,
-            |color_attachment| {
-                color_attachment.set_load_action(metal::MTLLoadAction::Clear);
-                color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
-            },
-        );
+        if use_backdrop && !self.ensure_backdrop_textures(viewport_size) {
+            return Ok(command_buffer.to_owned());
+        }
+
+        let main_texture = if use_backdrop {
+            Some(
+                self.backdrop_main_texture
+                    .as_ref()
+                    .expect("backdrop main texture missing"),
+            )
+        } else {
+            None
+        };
+
+        let clear_color = metal::MTLClearColor::new(0.0, 0.0, 0.0, alpha as f64);
+
+        let mut command_encoder = if let Some(main_texture) = main_texture {
+            new_texture_command_encoder(
+                command_buffer,
+                main_texture,
+                viewport_size,
+                metal::MTLLoadAction::Clear,
+                clear_color,
+            )
+        } else {
+            new_command_encoder(
+                command_buffer,
+                drawable,
+                viewport_size,
+                |color_attachment| {
+                    color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                    color_attachment.set_clear_color(clear_color);
+                },
+            )
+        };
 
         for batch in scene.batches() {
             let ok = match batch {
@@ -598,6 +793,28 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::BackdropFilters(range) => {
+                    let Some(main_texture) = main_texture else {
+                        return Err(anyhow::anyhow!("backdrop filter without main texture"));
+                    };
+                    command_encoder.end_encoding();
+                    let ok = self.draw_backdrop_filters(
+                        &scene.backdrop_filters[range],
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_buffer,
+                        main_texture,
+                    );
+                    command_encoder = new_texture_command_encoder(
+                        command_buffer,
+                        main_texture,
+                        viewport_size,
+                        metal::MTLLoadAction::Load,
+                        clear_color,
+                    );
+                    ok
+                }
                 PrimitiveBatch::Quads(range) => self.draw_quads(
                     &scene.quads[range],
                     instance_buffer,
@@ -617,14 +834,24 @@ impl MetalRenderer {
                         command_buffer,
                     );
 
-                    command_encoder = new_command_encoder(
-                        command_buffer,
-                        drawable,
-                        viewport_size,
-                        |color_attachment| {
-                            color_attachment.set_load_action(metal::MTLLoadAction::Load);
-                        },
-                    );
+                    command_encoder = if let Some(main_texture) = main_texture {
+                        new_texture_command_encoder(
+                            command_buffer,
+                            main_texture,
+                            viewport_size,
+                            metal::MTLLoadAction::Load,
+                            clear_color,
+                        )
+                    } else {
+                        new_command_encoder(
+                            command_buffer,
+                            drawable,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                            },
+                        )
+                    };
 
                     if did_draw {
                         self.draw_paths_from_intermediate(
@@ -688,6 +915,17 @@ impl MetalRenderer {
         }
 
         command_encoder.end_encoding();
+
+        if let Some(main_texture) = main_texture {
+            self.blit_backdrop_to_drawable(
+                instance_buffer,
+                &mut instance_offset,
+                viewport_size,
+                command_buffer,
+                drawable,
+                main_texture,
+            )?;
+        }
 
         if !self.is_unified_memory {
             // Sync the instance buffer to the GPU
@@ -1307,6 +1545,393 @@ impl MetalRenderer {
         }
         true
     }
+
+    fn draw_backdrop_filters(
+        &self,
+        filters: &[BackdropFilter],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+        main_texture: &metal::TextureRef,
+    ) -> bool {
+        let full_size = [
+            viewport_size.width.0.max(1) as u32,
+            viewport_size.height.0.max(1) as u32,
+        ];
+        let full_size_f = [full_size[0] as f32, full_size[1] as f32];
+
+        let Some(temp_full) = self.backdrop_temp_texture.as_ref() else {
+            return false;
+        };
+
+        for filter in filters {
+            let radius = filter.blur_radius.0.max(0.0);
+            if radius <= 0.0 {
+                continue;
+            }
+
+            let scale = if radius <= 8.0 {
+                1
+            } else if radius <= 16.0 {
+                2
+            } else {
+                4
+            };
+
+            let kernel = (radius * 1.5).ceil();
+            let expanded_bounds =
+                filter.bounds.dilate(ScaledPixels::from(kernel + 2.0));
+            let expanded_scaled = if scale == 1 {
+                expanded_bounds
+            } else {
+                Self::scale_bounds(expanded_bounds, 1.0 / scale as f32)
+            };
+
+            let target_size_u32 = match scale {
+                1 => full_size,
+                2 => [(full_size[0] + 1) / 2, (full_size[1] + 1) / 2],
+                _ => [(full_size[0] + 3) / 4, (full_size[1] + 3) / 4],
+            };
+            let target_size_f = [target_size_u32[0] as f32, target_size_u32[1] as f32];
+            let scissor_expanded = Self::scissor_from_bounds(expanded_scaled, target_size_u32);
+            let scissor_full = Self::scissor_from_bounds(filter.bounds, full_size);
+
+            let (weights0, weights1, step) = Self::gaussian_weights(radius, scale as f32);
+            let texel_step = [
+                step / target_size_f[0].max(1.0),
+                step / target_size_f[1].max(1.0),
+            ];
+
+            let (down_texture, temp_texture) = match scale {
+                1 => (None, temp_full),
+                2 => (
+                    Some(
+                        self.backdrop_down2_texture
+                            .as_ref()
+                            .expect("backdrop down2 texture missing"),
+                    ),
+                    self.backdrop_temp2_texture
+                        .as_ref()
+                        .expect("backdrop temp2 texture missing"),
+                ),
+                _ => (
+                    Some(
+                        self.backdrop_down4_texture
+                            .as_ref()
+                            .expect("backdrop down4 texture missing"),
+                    ),
+                    self.backdrop_temp4_texture
+                        .as_ref()
+                        .expect("backdrop temp4 texture missing"),
+                ),
+            };
+
+            if scale > 1 {
+                let Some(scissor) = scissor_expanded else {
+                    continue;
+                };
+                let blit_instance =
+                    BackdropBlurInstance::blit_instance(expanded_scaled, target_size_f);
+                let ok = self.draw_backdrop_pass(
+                    &blit_instance,
+                    instance_buffer,
+                    instance_offset,
+                    command_buffer,
+                    &self.backdrop_blur_blit_pipeline_state,
+                    down_texture.expect("downsample texture missing"),
+                    main_texture,
+                    Size {
+                        width: DevicePixels(target_size_u32[0] as i32),
+                        height: DevicePixels(target_size_u32[1] as i32),
+                    },
+                    Some(scissor),
+                );
+                if !ok {
+                    return false;
+                }
+            }
+
+            let Some(scissor) = scissor_expanded else {
+                continue;
+            };
+            let source_texture = down_texture.unwrap_or(main_texture);
+            let blur_instance = BackdropBlurInstance::blur_instance(
+                expanded_scaled,
+                expanded_scaled,
+                Corners::default(),
+                1.0,
+                [1.0, 0.0],
+                texel_step,
+                target_size_f,
+                weights0,
+                weights1,
+            );
+            let ok = self.draw_backdrop_pass(
+                &blur_instance,
+                instance_buffer,
+                instance_offset,
+                command_buffer,
+                &self.backdrop_blur_h_pipeline_state,
+                temp_texture,
+                source_texture,
+                Size {
+                    width: DevicePixels(target_size_u32[0] as i32),
+                    height: DevicePixels(target_size_u32[1] as i32),
+                },
+                Some(scissor),
+            );
+            if !ok {
+                return false;
+            }
+
+            let Some(scissor) = scissor_full else {
+                continue;
+            };
+            let composite_instance = BackdropBlurInstance::blur_instance(
+                filter.bounds,
+                filter.content_mask.bounds,
+                filter.corner_radii,
+                filter.opacity,
+                [0.0, 1.0],
+                texel_step,
+                full_size_f,
+                weights0,
+                weights1,
+            );
+            let ok = self.draw_backdrop_pass(
+                &composite_instance,
+                instance_buffer,
+                instance_offset,
+                command_buffer,
+                &self.backdrop_blur_composite_pipeline_state,
+                main_texture,
+                temp_texture,
+                viewport_size,
+                Some(scissor),
+            );
+            if !ok {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn draw_backdrop_pass(
+        &self,
+        instance: &BackdropBlurInstance,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        command_buffer: &metal::CommandBufferRef,
+        pipeline_state: &metal::RenderPipelineState,
+        target_texture: &metal::TextureRef,
+        source_texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        scissor: Option<metal::MTLScissorRect>,
+    ) -> bool {
+        align_offset(instance_offset);
+        let instance_bytes_len = mem::size_of_val(instance);
+        let next_offset = *instance_offset + instance_bytes_len;
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+
+        unsafe {
+            let buffer_contents =
+                (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset);
+            ptr::copy_nonoverlapping(
+                instance as *const BackdropBlurInstance as *const u8,
+                buffer_contents,
+                instance_bytes_len,
+            );
+        }
+
+        let mut command_encoder = new_texture_command_encoder(
+            command_buffer,
+            target_texture,
+            viewport_size,
+            metal::MTLLoadAction::Load,
+            metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0),
+        );
+        command_encoder.set_render_pipeline_state(pipeline_state);
+        command_encoder.set_vertex_buffer(
+            BackdropBlurInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            BackdropBlurInputIndex::BackdropBlurs as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            BackdropBlurInputIndex::BackdropBlurs as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_texture(
+            BackdropBlurInputIndex::SourceTexture as u64,
+            Some(source_texture),
+        );
+        if let Some(scissor) = scissor {
+            command_encoder.set_scissor_rect(scissor);
+        }
+        command_encoder.draw_primitives_instanced(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            6,
+            1,
+        );
+        command_encoder.end_encoding();
+
+        *instance_offset = next_offset;
+        true
+    }
+
+    fn blit_backdrop_to_drawable(
+        &self,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+        drawable: &metal::MetalDrawableRef,
+        main_texture: &metal::TextureRef,
+    ) -> Result<()> {
+        let bounds = Bounds {
+            origin: point(ScaledPixels::from(0.0), ScaledPixels::from(0.0)),
+            size: size(
+                ScaledPixels::from(viewport_size.width.0 as f32),
+                ScaledPixels::from(viewport_size.height.0 as f32),
+            ),
+        };
+        let blit_instance = BackdropBlurInstance::blit_instance(
+            bounds,
+            [viewport_size.width.0 as f32, viewport_size.height.0 as f32],
+        );
+
+        align_offset(instance_offset);
+        let instance_bytes_len = mem::size_of_val(&blit_instance);
+        let next_offset = *instance_offset + instance_bytes_len;
+        if next_offset > instance_buffer.size {
+            anyhow::bail!("scene too large for instance buffer");
+        }
+
+        unsafe {
+            let buffer_contents =
+                (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset);
+            ptr::copy_nonoverlapping(
+                &blit_instance as *const BackdropBlurInstance as *const u8,
+                buffer_contents,
+                instance_bytes_len,
+            );
+        }
+
+        let alpha = if self.layer.is_opaque() { 1.0 } else { 0.0 };
+        let mut command_encoder = new_command_encoder(
+            command_buffer,
+            drawable,
+            viewport_size,
+            |color_attachment| {
+                color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                color_attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, alpha));
+            },
+        );
+        command_encoder.set_render_pipeline_state(&self.backdrop_blur_blit_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            BackdropBlurInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            BackdropBlurInputIndex::BackdropBlurs as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            BackdropBlurInputIndex::BackdropBlurs as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_texture(
+            BackdropBlurInputIndex::SourceTexture as u64,
+            Some(main_texture),
+        );
+        command_encoder.draw_primitives_instanced(
+            metal::MTLPrimitiveType::Triangle,
+            0,
+            6,
+            1,
+        );
+        command_encoder.end_encoding();
+        *instance_offset = next_offset;
+        Ok(())
+    }
+
+    fn scale_bounds(bounds: Bounds<ScaledPixels>, factor: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(
+                ScaledPixels::from(bounds.origin.x.0 * factor),
+                ScaledPixels::from(bounds.origin.y.0 * factor),
+            ),
+            size: size(
+                ScaledPixels::from(bounds.size.width.0 * factor),
+                ScaledPixels::from(bounds.size.height.0 * factor),
+            ),
+        }
+    }
+
+    fn scissor_from_bounds(
+        bounds: Bounds<ScaledPixels>,
+        target_size: [u32; 2],
+    ) -> Option<metal::MTLScissorRect> {
+        let min_x = bounds.origin.x.0.max(0.0).floor() as i32;
+        let min_y = bounds.origin.y.0.max(0.0).floor() as i32;
+        let max_x = (bounds.origin.x.0 + bounds.size.width.0)
+            .min(target_size[0] as f32)
+            .ceil() as i32;
+        let max_y = (bounds.origin.y.0 + bounds.size.height.0)
+            .min(target_size[1] as f32)
+            .ceil() as i32;
+
+        if max_x <= min_x || max_y <= min_y {
+            return None;
+        }
+
+        Some(metal::MTLScissorRect {
+            x: min_x as u64,
+            y: min_y as u64,
+            width: (max_x - min_x) as u64,
+            height: (max_y - min_y) as u64,
+        })
+    }
+
+    fn gaussian_weights(radius: f32, scale: f32) -> ([f32; 4], [f32; 4], f32) {
+        let radius_ds = (radius / scale).max(0.0);
+        let step = (radius_ds / 4.0).max(1.0);
+        let sigma = (radius_ds / 2.0).max(0.5);
+
+        let mut weights = [0.0f32; 5];
+        for i in 0..5 {
+            let x = i as f32 * step;
+            weights[i] = (-x * x / (2.0 * sigma * sigma)).exp();
+        }
+        let mut sum = weights[0];
+        for i in 1..5 {
+            sum += 2.0 * weights[i];
+        }
+        if sum > 0.0 {
+            for w in &mut weights {
+                *w /= sum;
+            }
+        }
+
+        (
+            [weights[0], weights[1], weights[2], weights[3]],
+            [weights[4], 0.0, 0.0, 0.0],
+            step,
+        )
+    }
 }
 
 fn new_command_encoder<'a>(
@@ -1323,6 +1948,37 @@ fn new_command_encoder<'a>(
     color_attachment.set_texture(Some(drawable.texture()));
     color_attachment.set_store_action(metal::MTLStoreAction::Store);
     configure_color_attachment(color_attachment);
+
+    let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+    command_encoder.set_viewport(metal::MTLViewport {
+        originX: 0.0,
+        originY: 0.0,
+        width: i32::from(viewport_size.width) as f64,
+        height: i32::from(viewport_size.height) as f64,
+        znear: 0.0,
+        zfar: 1.0,
+    });
+    command_encoder
+}
+
+fn new_texture_command_encoder<'a>(
+    command_buffer: &'a metal::CommandBufferRef,
+    texture: &'a metal::TextureRef,
+    viewport_size: Size<DevicePixels>,
+    load_action: metal::MTLLoadAction,
+    clear_color: metal::MTLClearColor,
+) -> &'a metal::RenderCommandEncoderRef {
+    let render_pass_descriptor = metal::RenderPassDescriptor::new();
+    let color_attachment = render_pass_descriptor
+        .color_attachments()
+        .object_at(0)
+        .unwrap();
+    color_attachment.set_texture(Some(texture));
+    color_attachment.set_store_action(metal::MTLStoreAction::Store);
+    color_attachment.set_load_action(load_action);
+    if load_action == metal::MTLLoadAction::Clear {
+        color_attachment.set_clear_color(clear_color);
+    }
 
     let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
     command_encoder.set_viewport(metal::MTLViewport {
@@ -1364,6 +2020,34 @@ fn build_pipeline_state(
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
+fn build_pipeline_state_no_blend(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(false);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -1492,6 +2176,13 @@ enum SurfaceInputIndex {
 enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
+}
+
+#[repr(C)]
+enum BackdropBlurInputIndex {
+    Vertices = 0,
+    BackdropBlurs = 1,
+    SourceTexture = 2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

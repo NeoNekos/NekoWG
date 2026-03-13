@@ -1,5 +1,5 @@
 //! The implementation of the this crate is kept in a separate module
-//! so that it is easy to publish this crate as part of NekoWG's dependencies
+//! so that it is easy to publish this crate as part of `NekoWG`'s dependencies
 
 use collections::HashMap;
 use serde::{Deserialize, Serialize};

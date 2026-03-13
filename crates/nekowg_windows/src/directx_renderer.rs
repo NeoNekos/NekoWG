@@ -7,7 +7,7 @@ use ::util::ResultExt;
 use anyhow::{Context, Result};
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, RECT},
         Graphics::{
             Direct3D::*,
             Direct3D11::*,
@@ -70,6 +70,26 @@ struct DirectXResources {
     render_target: Option<ID3D11Texture2D>,
     render_target_view: Option<ID3D11RenderTargetView>,
 
+    // Backdrop blur textures
+    backdrop_main_texture: ID3D11Texture2D,
+    backdrop_main_rtv: Option<ID3D11RenderTargetView>,
+    backdrop_main_srv: Option<ID3D11ShaderResourceView>,
+    backdrop_temp_texture: ID3D11Texture2D,
+    backdrop_temp_rtv: Option<ID3D11RenderTargetView>,
+    backdrop_temp_srv: Option<ID3D11ShaderResourceView>,
+    backdrop_down2_texture: ID3D11Texture2D,
+    backdrop_down2_rtv: Option<ID3D11RenderTargetView>,
+    backdrop_down2_srv: Option<ID3D11ShaderResourceView>,
+    backdrop_temp2_texture: ID3D11Texture2D,
+    backdrop_temp2_rtv: Option<ID3D11RenderTargetView>,
+    backdrop_temp2_srv: Option<ID3D11ShaderResourceView>,
+    backdrop_down4_texture: ID3D11Texture2D,
+    backdrop_down4_rtv: Option<ID3D11RenderTargetView>,
+    backdrop_down4_srv: Option<ID3D11ShaderResourceView>,
+    backdrop_temp4_texture: ID3D11Texture2D,
+    backdrop_temp4_rtv: Option<ID3D11RenderTargetView>,
+    backdrop_temp4_srv: Option<ID3D11ShaderResourceView>,
+
     // Path intermediate textures (with MSAA)
     path_intermediate_texture: ID3D11Texture2D,
     path_intermediate_srv: Option<ID3D11ShaderResourceView>,
@@ -83,6 +103,9 @@ struct DirectXResources {
 struct DirectXRenderPipelines {
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
+    backdrop_blur_h_pipeline: PipelineState<BackdropBlurInstance>,
+    backdrop_blur_composite_pipeline: PipelineState<BackdropBlurInstance>,
+    backdrop_blur_blit_pipeline: PipelineState<BackdropBlurInstance>,
     path_rasterization_pipeline: PipelineState<PathRasterizationSprite>,
     path_sprite_pipeline: PipelineState<PathSprite>,
     underline_pipeline: PipelineState<Underline>,
@@ -180,7 +203,11 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
-    fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
+    fn pre_draw(
+        &self,
+        clear_color: &[f32; 4],
+        render_target_view: &ID3D11RenderTargetView,
+    ) -> Result<()> {
         let resources = self.resources.as_ref().expect("resources missing");
         let device_context = &self
             .devices
@@ -198,16 +225,17 @@ impl DirectXRenderer {
             }],
         )?;
         unsafe {
-            device_context.ClearRenderTargetView(
-                resources
-                    .render_target_view
-                    .as_ref()
-                    .context("missing render target view")?,
-                clear_color,
-            );
-            device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            device_context.ClearRenderTargetView(render_target_view, clear_color);
+            let rtv = Some(render_target_view.clone());
+            device_context.OMSetRenderTargets(Some(slice::from_ref(&rtv)), None);
             device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            let scissor = RECT {
+                left: 0,
+                top: 0,
+                right: resources.viewport.Width as i32,
+                bottom: resources.viewport.Height as i32,
+            };
+            device_context.RSSetScissorRects(Some(slice::from_ref(&scissor)));
         }
         Ok(())
     }
@@ -308,20 +336,37 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
-        self.pre_draw(&match background_appearance {
+        let clear_color = match background_appearance {
             WindowBackgroundAppearance::Opaque => [1.0f32; 4],
             _ => [0.0f32; 4],
-        })?;
+        };
+
+        let use_backdrop = !scene.backdrop_filters.is_empty();
+        let main_rtv = {
+            let resources = self.resources.as_ref().context("resources missing")?;
+            if use_backdrop {
+                resources.backdrop_main_rtv.clone()
+            } else {
+                resources.render_target_view.clone()
+            }
+        };
+        let main_rtv = main_rtv.as_ref().context("missing render target view")?;
+
+        self.pre_draw(&clear_color, main_rtv)?;
 
         self.upload_scene_buffers(scene)?;
 
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
+                PrimitiveBatch::BackdropFilters(range) => self.draw_backdrop_filters(
+                    &scene.backdrop_filters[range],
+                    main_rtv,
+                ),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
+                    self.draw_paths_to_intermediate(paths, main_rtv)?;
                     self.draw_paths_from_intermediate(paths)
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
@@ -348,6 +393,10 @@ impl DirectXRenderer {
                 scene.polychrome_sprites.len(),
                 scene.surfaces.len(),
             ))?;
+        }
+
+        if use_backdrop {
+            self.blit_backdrop_to_frame()?;
         }
         self.present()
     }
@@ -494,7 +543,11 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    fn draw_paths_to_intermediate(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        render_target_view: &ID3D11RenderTargetView,
+    ) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -551,9 +604,10 @@ impl DirectXRenderer {
                 RENDER_TARGET_FORMAT,
             );
             // Restore main render target
+            let rtv = Some(render_target_view.clone());
             devices
                 .device_context
-                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+                .OMSetRenderTargets(Some(slice::from_ref(&rtv)), None);
         }
 
         Ok(())
@@ -602,6 +656,348 @@ impl DirectXRenderer {
             slice::from_ref(&self.globals.global_params_buffer),
             slice::from_ref(&self.globals.sampler),
             sprites.len() as u32,
+        )
+    }
+
+    fn draw_backdrop_filters(
+        &mut self,
+        filters: &[BackdropFilter],
+        main_rtv: &ID3D11RenderTargetView,
+    ) -> Result<()> {
+        if filters.is_empty() {
+            return Ok(());
+        }
+
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let device = &devices.device;
+        let device_context = &devices.device_context;
+
+        let full_width = self.width;
+        let full_height = self.height;
+        let full_viewport = resources.viewport;
+
+        let set_viewport = |width: u32, height: u32| {
+            let viewport = D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: width as f32,
+                Height: height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            unsafe { device_context.RSSetViewports(Some(slice::from_ref(&viewport))) };
+            viewport
+        };
+
+        for filter in filters {
+            let radius = filter.blur_radius.as_f32().max(0.0);
+            if radius <= 0.0 {
+                continue;
+            }
+
+            let scale = if radius <= 8.0 {
+                1u32
+            } else if radius <= 16.0 {
+                2u32
+            } else {
+                4u32
+            };
+
+            let kernel = (radius * 1.5).ceil();
+            let expanded = filter
+                .bounds
+                .dilate(ScaledPixels::from(kernel + 2.0));
+            let expanded_scaled = if scale == 1 {
+                expanded
+            } else {
+                scale_bounds(expanded, 1.0 / scale as f32)
+            };
+
+            let target_width = match scale {
+                1 => full_width,
+                2 => full_width.div_ceil(2),
+                _ => full_width.div_ceil(4),
+            };
+            let target_height = match scale {
+                1 => full_height,
+                2 => full_height.div_ceil(2),
+                _ => full_height.div_ceil(4),
+            };
+
+            let scissor_expanded = scissor_from_bounds(expanded_scaled, target_width, target_height);
+            let scissor_full = scissor_from_bounds(filter.bounds, full_width, full_height);
+
+            let (weights0, weights1, step) = gaussian_weights(radius, scale as f32);
+            let texel_step = [step / target_width as f32, step / target_height as f32];
+
+            let (down_rtv, down_srv, temp_rtv, temp_srv) = match scale {
+                1 => (
+                    None,
+                    None,
+                    resources
+                        .backdrop_temp_rtv
+                        .as_ref()
+                        .context("missing backdrop temp rtv")?,
+                    resources
+                        .backdrop_temp_srv
+                        .as_ref()
+                        .context("missing backdrop temp srv")?,
+                ),
+                2 => (
+                    Some(
+                        resources
+                            .backdrop_down2_rtv
+                            .as_ref()
+                            .context("missing backdrop down2 rtv")?,
+                    ),
+                    Some(
+                        resources
+                            .backdrop_down2_srv
+                            .as_ref()
+                            .context("missing backdrop down2 srv")?,
+                    ),
+                    resources
+                        .backdrop_temp2_rtv
+                        .as_ref()
+                        .context("missing backdrop temp2 rtv")?,
+                    resources
+                        .backdrop_temp2_srv
+                        .as_ref()
+                        .context("missing backdrop temp2 srv")?,
+                ),
+                _ => (
+                    Some(
+                        resources
+                            .backdrop_down4_rtv
+                            .as_ref()
+                            .context("missing backdrop down4 rtv")?,
+                    ),
+                    Some(
+                        resources
+                            .backdrop_down4_srv
+                            .as_ref()
+                            .context("missing backdrop down4 srv")?,
+                    ),
+                    resources
+                        .backdrop_temp4_rtv
+                        .as_ref()
+                        .context("missing backdrop temp4 rtv")?,
+                    resources
+                        .backdrop_temp4_srv
+                        .as_ref()
+                        .context("missing backdrop temp4 srv")?,
+                ),
+            };
+
+            let main_srv = resources
+                .backdrop_main_srv
+                .as_ref()
+                .context("missing backdrop main srv")?;
+
+            if scale > 1 {
+                let Some(scissor) = scissor_expanded else {
+                    continue;
+                };
+                unsafe {
+                    let rtv = Some(down_rtv.unwrap().clone());
+                    device_context.OMSetRenderTargets(Some(slice::from_ref(&rtv)), None);
+                    device_context.RSSetScissorRects(Some(slice::from_ref(&scissor)));
+                }
+                let down_viewport = set_viewport(target_width, target_height);
+
+                let instance = BackdropBlurInstance {
+                    bounds: expanded_scaled,
+                    content_mask: expanded_scaled,
+                    corner_radii: Corners::default(),
+                    opacity: 1.0,
+                    _pad0: [0.0; 3],
+                    direction: [1.0, 0.0],
+                    texel_step: [0.0, 0.0],
+                    viewport_size: [target_width as f32, target_height as f32],
+                    _pad1: [0.0; 2],
+                    weights0: [1.0, 0.0, 0.0, 0.0],
+                    weights1: [0.0, 0.0, 0.0, 0.0],
+                };
+                self.pipelines.backdrop_blur_blit_pipeline.update_buffer(
+                    device,
+                    device_context,
+                    &[instance],
+                )?;
+                self.pipelines.backdrop_blur_blit_pipeline.draw_with_texture(
+                    device_context,
+                    slice::from_ref(&Some(main_srv.clone())),
+                    slice::from_ref(&down_viewport),
+                    slice::from_ref(&self.globals.global_params_buffer),
+                    slice::from_ref(&self.globals.sampler),
+                    1,
+                )?;
+            }
+
+            let source_srv = down_srv.unwrap_or(main_srv);
+            let Some(scissor) = scissor_expanded else {
+                continue;
+            };
+            unsafe {
+                let rtv = Some(temp_rtv.clone());
+                device_context.OMSetRenderTargets(Some(slice::from_ref(&rtv)), None);
+                device_context.RSSetScissorRects(Some(slice::from_ref(&scissor)));
+            }
+            let blur_viewport = if scale == 1 {
+                full_viewport
+            } else {
+                set_viewport(target_width, target_height)
+            };
+
+            let blur_instance = BackdropBlurInstance {
+                bounds: expanded_scaled,
+                content_mask: expanded_scaled,
+                corner_radii: Corners::default(),
+                opacity: 1.0,
+                _pad0: [0.0; 3],
+                direction: [1.0, 0.0],
+                texel_step,
+                viewport_size: [target_width as f32, target_height as f32],
+                _pad1: [0.0; 2],
+                weights0,
+                weights1,
+            };
+            self.pipelines.backdrop_blur_h_pipeline.update_buffer(
+                device,
+                device_context,
+                &[blur_instance],
+            )?;
+            self.pipelines.backdrop_blur_h_pipeline.draw_with_texture(
+                device_context,
+                slice::from_ref(&Some(source_srv.clone())),
+                slice::from_ref(&blur_viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.sampler),
+                1,
+            )?;
+
+            let Some(scissor_full) = scissor_full else {
+                continue;
+            };
+            unsafe {
+                let rtv = Some(main_rtv.clone());
+                device_context.OMSetRenderTargets(Some(slice::from_ref(&rtv)), None);
+                device_context.RSSetScissorRects(Some(slice::from_ref(&scissor_full)));
+            }
+            set_viewport(full_width, full_height);
+
+            let composite_instance = BackdropBlurInstance {
+                bounds: filter.bounds,
+                content_mask: filter.content_mask.bounds,
+                corner_radii: filter.corner_radii,
+                opacity: filter.opacity,
+                _pad0: [0.0; 3],
+                direction: [0.0, 1.0],
+                texel_step,
+                viewport_size: [full_width as f32, full_height as f32],
+                _pad1: [0.0; 2],
+                weights0,
+                weights1,
+            };
+            self.pipelines
+                .backdrop_blur_composite_pipeline
+                .update_buffer(device, device_context, &[composite_instance])?;
+            self.pipelines
+                .backdrop_blur_composite_pipeline
+                .draw_with_texture(
+                    device_context,
+                    slice::from_ref(&Some(temp_srv.clone())),
+                    slice::from_ref(&full_viewport),
+                    slice::from_ref(&self.globals.global_params_buffer),
+                    slice::from_ref(&self.globals.sampler),
+                    1,
+                )?;
+        }
+
+        unsafe {
+            let rtv = Some(main_rtv.clone());
+            device_context.OMSetRenderTargets(Some(slice::from_ref(&rtv)), None);
+            device_context.RSSetViewports(Some(slice::from_ref(&full_viewport)));
+            let full_scissor = RECT {
+                left: 0,
+                top: 0,
+                right: full_width as i32,
+                bottom: full_height as i32,
+            };
+            device_context.RSSetScissorRects(Some(slice::from_ref(&full_scissor)));
+        }
+
+        Ok(())
+    }
+
+    fn blit_backdrop_to_frame(&mut self) -> Result<()> {
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let main_srv = resources
+            .backdrop_main_srv
+            .as_ref()
+            .context("missing backdrop main srv")?;
+        let backbuffer_rtv = resources
+            .render_target_view
+            .as_ref()
+            .context("missing render target view")?;
+
+        let instance = BackdropBlurInstance {
+            bounds: Bounds {
+                origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size: size(
+                    ScaledPixels(self.width as f32),
+                    ScaledPixels(self.height as f32),
+                ),
+            },
+            content_mask: Bounds {
+                origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size: size(
+                    ScaledPixels(self.width as f32),
+                    ScaledPixels(self.height as f32),
+                ),
+            },
+            corner_radii: Corners::default(),
+            opacity: 1.0,
+            _pad0: [0.0; 3],
+            direction: [1.0, 0.0],
+            texel_step: [0.0, 0.0],
+            viewport_size: [self.width as f32, self.height as f32],
+            _pad1: [0.0; 2],
+            weights0: [1.0, 0.0, 0.0, 0.0],
+            weights1: [0.0, 0.0, 0.0, 0.0],
+        };
+
+        unsafe {
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&Some(backbuffer_rtv.clone()))), None);
+            devices
+                .device_context
+                .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            let full_scissor = RECT {
+                left: 0,
+                top: 0,
+                right: self.width as i32,
+                bottom: self.height as i32,
+            };
+            devices
+                .device_context
+                .RSSetScissorRects(Some(slice::from_ref(&full_scissor)));
+        }
+
+        self.pipelines.backdrop_blur_blit_pipeline.update_buffer(
+            &devices.device,
+            &devices.device_context,
+            &[instance],
+        )?;
+        self.pipelines.backdrop_blur_blit_pipeline.draw_with_texture(
+            &devices.device_context,
+            slice::from_ref(&Some(main_srv.clone())),
+            slice::from_ref(&resources.viewport),
+            slice::from_ref(&self.globals.global_params_buffer),
+            slice::from_ref(&self.globals.sampler),
+            1,
         )
     }
 
@@ -778,12 +1174,49 @@ impl DirectXResources {
             path_intermediate_msaa_view,
             viewport,
         ) = create_resources(devices, &swap_chain, width, height)?;
+
+        let (backdrop_main_texture, backdrop_main_rtv, backdrop_main_srv) =
+            create_backdrop_texture(&devices.device, width, height)?;
+        let (backdrop_temp_texture, backdrop_temp_rtv, backdrop_temp_srv) =
+            create_backdrop_texture(&devices.device, width, height)?;
+
+        let down2_width = width.div_ceil(2);
+        let down2_height = height.div_ceil(2);
+        let down4_width = width.div_ceil(4);
+        let down4_height = height.div_ceil(4);
+
+        let (backdrop_down2_texture, backdrop_down2_rtv, backdrop_down2_srv) =
+            create_backdrop_texture(&devices.device, down2_width, down2_height)?;
+        let (backdrop_temp2_texture, backdrop_temp2_rtv, backdrop_temp2_srv) =
+            create_backdrop_texture(&devices.device, down2_width, down2_height)?;
+        let (backdrop_down4_texture, backdrop_down4_rtv, backdrop_down4_srv) =
+            create_backdrop_texture(&devices.device, down4_width, down4_height)?;
+        let (backdrop_temp4_texture, backdrop_temp4_rtv, backdrop_temp4_srv) =
+            create_backdrop_texture(&devices.device, down4_width, down4_height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
             swap_chain,
             render_target: Some(render_target),
             render_target_view,
+            backdrop_main_texture,
+            backdrop_main_rtv,
+            backdrop_main_srv,
+            backdrop_temp_texture,
+            backdrop_temp_rtv,
+            backdrop_temp_srv,
+            backdrop_down2_texture,
+            backdrop_down2_rtv,
+            backdrop_down2_srv,
+            backdrop_temp2_texture,
+            backdrop_temp2_rtv,
+            backdrop_temp2_srv,
+            backdrop_down4_texture,
+            backdrop_down4_rtv,
+            backdrop_down4_srv,
+            backdrop_temp4_texture,
+            backdrop_temp4_rtv,
+            backdrop_temp4_srv,
             path_intermediate_texture,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
@@ -808,8 +1241,45 @@ impl DirectXResources {
             path_intermediate_msaa_view,
             viewport,
         ) = create_resources(devices, &self.swap_chain, width, height)?;
+
+        let (backdrop_main_texture, backdrop_main_rtv, backdrop_main_srv) =
+            create_backdrop_texture(&devices.device, width, height)?;
+        let (backdrop_temp_texture, backdrop_temp_rtv, backdrop_temp_srv) =
+            create_backdrop_texture(&devices.device, width, height)?;
+
+        let down2_width = width.div_ceil(2);
+        let down2_height = height.div_ceil(2);
+        let down4_width = width.div_ceil(4);
+        let down4_height = height.div_ceil(4);
+
+        let (backdrop_down2_texture, backdrop_down2_rtv, backdrop_down2_srv) =
+            create_backdrop_texture(&devices.device, down2_width, down2_height)?;
+        let (backdrop_temp2_texture, backdrop_temp2_rtv, backdrop_temp2_srv) =
+            create_backdrop_texture(&devices.device, down2_width, down2_height)?;
+        let (backdrop_down4_texture, backdrop_down4_rtv, backdrop_down4_srv) =
+            create_backdrop_texture(&devices.device, down4_width, down4_height)?;
+        let (backdrop_temp4_texture, backdrop_temp4_rtv, backdrop_temp4_srv) =
+            create_backdrop_texture(&devices.device, down4_width, down4_height)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
+        self.backdrop_main_texture = backdrop_main_texture;
+        self.backdrop_main_rtv = backdrop_main_rtv;
+        self.backdrop_main_srv = backdrop_main_srv;
+        self.backdrop_temp_texture = backdrop_temp_texture;
+        self.backdrop_temp_rtv = backdrop_temp_rtv;
+        self.backdrop_temp_srv = backdrop_temp_srv;
+        self.backdrop_down2_texture = backdrop_down2_texture;
+        self.backdrop_down2_rtv = backdrop_down2_rtv;
+        self.backdrop_down2_srv = backdrop_down2_srv;
+        self.backdrop_temp2_texture = backdrop_temp2_texture;
+        self.backdrop_temp2_rtv = backdrop_temp2_rtv;
+        self.backdrop_temp2_srv = backdrop_temp2_srv;
+        self.backdrop_down4_texture = backdrop_down4_texture;
+        self.backdrop_down4_rtv = backdrop_down4_rtv;
+        self.backdrop_down4_srv = backdrop_down4_srv;
+        self.backdrop_temp4_texture = backdrop_temp4_texture;
+        self.backdrop_temp4_rtv = backdrop_temp4_rtv;
+        self.backdrop_temp4_srv = backdrop_temp4_srv;
         self.path_intermediate_texture = path_intermediate_texture;
         self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
@@ -834,6 +1304,27 @@ impl DirectXRenderPipelines {
             ShaderModule::Quad,
             64,
             create_blend_state(device)?,
+        )?;
+        let backdrop_blur_h_pipeline = PipelineState::new(
+            device,
+            "backdrop_blur_h_pipeline",
+            ShaderModule::BackdropBlurH,
+            4,
+            create_blend_state_no_blend(device)?,
+        )?;
+        let backdrop_blur_composite_pipeline = PipelineState::new(
+            device,
+            "backdrop_blur_composite_pipeline",
+            ShaderModule::BackdropBlurComposite,
+            4,
+            create_blend_state(device)?,
+        )?;
+        let backdrop_blur_blit_pipeline = PipelineState::new(
+            device,
+            "backdrop_blur_blit_pipeline",
+            ShaderModule::BackdropBlurBlit,
+            4,
+            create_blend_state_no_blend(device)?,
         )?;
         let path_rasterization_pipeline = PipelineState::new(
             device,
@@ -881,6 +1372,9 @@ impl DirectXRenderPipelines {
         Ok(Self {
             shadow_pipeline,
             quad_pipeline,
+            backdrop_blur_h_pipeline,
+            backdrop_blur_composite_pipeline,
+            backdrop_blur_blit_pipeline,
             path_rasterization_pipeline,
             path_sprite_pipeline,
             underline_pipeline,
@@ -1152,6 +1646,22 @@ struct PathRasterizationSprite {
 
 #[derive(Clone, Copy)]
 #[repr(C)]
+struct BackdropBlurInstance {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: Bounds<ScaledPixels>,
+    corner_radii: Corners<ScaledPixels>,
+    opacity: f32,
+    _pad0: [f32; 3],
+    direction: [f32; 2],
+    texel_step: [f32; 2],
+    viewport_size: [f32; 2],
+    _pad1: [f32; 2],
+    weights0: [f32; 4],
+    weights1: [f32; 4],
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
 }
@@ -1336,6 +1846,47 @@ fn create_path_intermediate_msaa_texture_and_view(
 }
 
 #[inline]
+fn create_backdrop_texture(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<(
+    ID3D11Texture2D,
+    Option<ID3D11RenderTargetView>,
+    Option<ID3D11ShaderResourceView>,
+)> {
+    let texture = unsafe {
+        let mut output = None;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width.max(1),
+            Height: height.max(1),
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        output.unwrap()
+    };
+
+    let mut rtv = None;
+    let mut srv = None;
+    unsafe {
+        device.CreateRenderTargetView(&texture, None, Some(&mut rtv))?;
+        device.CreateShaderResourceView(&texture, None, Some(&mut srv))?;
+    }
+
+    Ok((texture, rtv, srv))
+}
+
+#[inline]
 fn set_viewport(device_context: &ID3D11DeviceContext, width: f32, height: f32) -> D3D11_VIEWPORT {
     let viewport = [D3D11_VIEWPORT {
         TopLeftX: 0.0,
@@ -1349,6 +1900,66 @@ fn set_viewport(device_context: &ID3D11DeviceContext, width: f32, height: f32) -
     viewport[0]
 }
 
+fn scale_bounds(bounds: Bounds<ScaledPixels>, factor: f32) -> Bounds<ScaledPixels> {
+    Bounds {
+        origin: point(bounds.origin.x * factor, bounds.origin.y * factor),
+        size: size(bounds.size.width * factor, bounds.size.height * factor),
+    }
+}
+
+fn scissor_from_bounds(
+    bounds: Bounds<ScaledPixels>,
+    target_width: u32,
+    target_height: u32,
+) -> Option<RECT> {
+    let min_x = bounds.origin.x.0.max(0.0).floor() as i32;
+    let min_y = bounds.origin.y.0.max(0.0).floor() as i32;
+    let max_x = (bounds.origin.x.0 + bounds.size.width.0)
+        .min(target_width as f32)
+        .ceil() as i32;
+    let max_y = (bounds.origin.y.0 + bounds.size.height.0)
+        .min(target_height as f32)
+        .ceil() as i32;
+
+    if max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+
+    Some(RECT {
+        left: min_x,
+        top: min_y,
+        right: max_x,
+        bottom: max_y,
+    })
+}
+
+fn gaussian_weights(radius: f32, scale: f32) -> ([f32; 4], [f32; 4], f32) {
+    let radius_ds = (radius / scale).max(0.0);
+    let step = (radius_ds / 4.0).max(1.0);
+    let sigma = (radius_ds / 2.0).max(0.5);
+
+    let mut weights = [0.0f32; 5];
+    for i in 0..5 {
+        let x = i as f32 * step;
+        weights[i] = (-x * x / (2.0 * sigma * sigma)).exp();
+    }
+    let mut sum = weights[0];
+    for i in 1..5 {
+        sum += 2.0 * weights[i];
+    }
+    if sum > 0.0 {
+        for w in &mut weights {
+            *w /= sum;
+        }
+    }
+
+    (
+        [weights[0], weights[1], weights[2], weights[3]],
+        [weights[4], 0.0, 0.0, 0.0],
+        step,
+    )
+}
+
 #[inline]
 fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceContext) -> Result<()> {
     let desc = D3D11_RASTERIZER_DESC {
@@ -1359,7 +1970,7 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         DepthBiasClamp: 0.0,
         SlopeScaledDepthBias: 0.0,
         DepthClipEnable: true.into(),
-        ScissorEnable: false.into(),
+        ScissorEnable: true.into(),
         MultisampleEnable: true.into(),
         AntialiasedLineEnable: false.into(),
     };
@@ -1383,6 +1994,18 @@ fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    unsafe {
+        let mut state = None;
+        device.CreateBlendState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
+#[inline]
+fn create_blend_state_no_blend(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0].BlendEnable = false.into();
     desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
     unsafe {
         let mut state = None;
@@ -1591,6 +2214,9 @@ pub(crate) mod shader_resources {
     pub(crate) enum ShaderModule {
         Quad,
         Shadow,
+        BackdropBlurH,
+        BackdropBlurComposite,
+        BackdropBlurBlit,
         Underline,
         PathRasterization,
         PathSprite,
@@ -1646,6 +2272,18 @@ pub(crate) mod shader_resources {
                 ShaderModule::Shadow => match target {
                     ShaderTarget::Vertex => SHADOW_VERTEX_BYTES,
                     ShaderTarget::Fragment => SHADOW_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropBlurH => match target {
+                    ShaderTarget::Vertex => BACKDROP_BLUR_H_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_BLUR_H_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropBlurComposite => match target {
+                    ShaderTarget::Vertex => BACKDROP_BLUR_COMPOSITE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_BLUR_COMPOSITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropBlurBlit => match target {
+                    ShaderTarget::Vertex => BACKDROP_BLUR_BLIT_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_BLUR_BLIT_FRAGMENT_BYTES,
                 },
                 ShaderModule::Underline => match target {
                     ShaderTarget::Vertex => UNDERLINE_VERTEX_BYTES,
@@ -1755,6 +2393,9 @@ pub(crate) mod shader_resources {
             match self {
                 ShaderModule::Quad => "quad",
                 ShaderModule::Shadow => "shadow",
+                ShaderModule::BackdropBlurH => "backdrop_blur_h",
+                ShaderModule::BackdropBlurComposite => "backdrop_blur_composite",
+                ShaderModule::BackdropBlurBlit => "backdrop_blur_blit",
                 ShaderModule::Underline => "underline",
                 ShaderModule::PathRasterization => "path_rasterization",
                 ShaderModule::PathSprite => "path_sprite",

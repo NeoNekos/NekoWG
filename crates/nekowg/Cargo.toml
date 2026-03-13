@@ -1,6 +1,6 @@
 [package]
 name = "nekowg"
-version = "0.2.21"
+version.workspace = true
 edition.workspace = true
 authors = ["Nathan Sobo <nathan@zed.dev>", "Yamrc <yamrci@outlook.com>"]
 description = "NekoWG core UI crate"

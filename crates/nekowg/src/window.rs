@@ -1,8 +1,9 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
 use crate::{
-    Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
+    AbsoluteLength, Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App,
+    AppContext, Arena, Asset, AsyncWindowContext, AvailableSpace, BackdropFilter, Background,
+    BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorStyle, DEFAULT_IMAGE_CACHE_BYTES, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
@@ -3109,6 +3110,41 @@ impl Window {
                 color: shadow.color.opacity(opacity),
             });
         }
+    }
+
+    /// Paint a backdrop blur primitive into the scene for the next frame.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop_blur(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        blur_radius: AbsoluteLength,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        if blur_radius.is_zero() {
+            return;
+        }
+
+        let rem_size = self.rem_size();
+        let blur_radius = blur_radius.to_pixels(rem_size);
+        if blur_radius.is_zero() {
+            return;
+        }
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+
+        self.next_frame.scene.insert_primitive(BackdropFilter {
+            order: 0,
+            blur_radius: blur_radius.scale(scale_factor),
+            bounds: bounds.scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            corner_radii: corner_radii.scale(scale_factor),
+            opacity,
+        });
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
