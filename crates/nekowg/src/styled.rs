@@ -694,6 +694,18 @@ pub trait Styled: Sized {
         self.backdrop_blur(px(64.0))
     }
 
+    /// Sets a tint color applied to the blurred backdrop.
+    fn backdrop_tint(mut self, tint: Hsla) -> Self {
+        self.style().backdrop_tint = Some(tint);
+        self
+    }
+
+    /// Sets the saturation multiplier applied to the blurred backdrop (1.0 = unchanged).
+    fn backdrop_saturation(mut self, saturation: f32) -> Self {
+        self.style().backdrop_saturation = Some(saturation);
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(cols);

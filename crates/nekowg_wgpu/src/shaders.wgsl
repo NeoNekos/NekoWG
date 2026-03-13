@@ -1031,7 +1031,9 @@ struct BackdropBlur {
     content_mask: Bounds,
     corner_radii: Corners,
     opacity: f32,
-    _pad0: vec3<f32>,
+    saturation: f32,
+    _pad0: vec2<f32>,
+    tint: Hsla,
     direction: vec2<f32>,
     texel_step: vec2<f32>,
     viewport_size: vec2<f32>,
@@ -1093,7 +1095,12 @@ fn fs_backdrop_blur_composite(input: BackdropBlurVarying) -> @location(0) vec4<f
     }
 
     let blur = b_backdrop_blurs[input.blur_id];
-    let blurred = gaussian_sample_sum(input.uv, blur.direction, blur.texel_step, blur.weights0, blur.weights1);
+    var blurred = gaussian_sample_sum(input.uv, blur.direction, blur.texel_step, blur.weights0, blur.weights1);
+    let saturation = max(0.0, blur.saturation);
+    let luma = dot(blurred.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let saturated = mix(vec3<f32>(luma), blurred.rgb, saturation);
+    let tint = hsla_to_rgba(blur.tint);
+    blurred.rgb = mix(saturated, tint.rgb, tint.a);
 
     let antialias_threshold = 0.5;
     let mask = saturate(antialias_threshold - quad_sdf(input.position.xy, blur.bounds, blur.corner_radii));

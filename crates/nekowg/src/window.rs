@@ -3120,6 +3120,8 @@ impl Window {
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
         blur_radius: AbsoluteLength,
+        tint: Hsla,
+        saturation: f32,
     ) {
         self.invalidator.debug_assert_paint();
 
@@ -3144,6 +3146,8 @@ impl Window {
             content_mask: content_mask.scale(scale_factor),
             corner_radii: corner_radii.scale(scale_factor),
             opacity,
+            tint,
+            saturation: saturation.max(0.0),
         });
     }
 

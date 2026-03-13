@@ -922,7 +922,9 @@ struct BackdropBlur {
     Bounds content_mask;
     Corners corner_radii;
     float opacity;
-    float3 _pad0;
+    float saturation;
+    float2 _pad0;
+    Hsla tint;
     float2 direction;
     float2 texel_step;
     float2 viewport_size;
@@ -993,6 +995,11 @@ float4 backdrop_blur_h_fragment(BackdropBlurFragmentInput input): SV_TARGET {
 float4 backdrop_blur_composite_fragment(BackdropBlurFragmentInput input): SV_TARGET {
     BackdropBlur blur = backdrop_blurs[input.blur_id];
     float4 blurred = gaussian_sample_sum(input.uv, blur.direction, blur.texel_step, blur.weights0, blur.weights1);
+    float saturation = max(0.0, blur.saturation);
+    float luma = dot(blurred.rgb, GRAYSCALE_FACTORS);
+    float3 saturated = lerp(float3(luma, luma, luma), blurred.rgb, saturation);
+    float4 tint = hsla_to_rgba(blur.tint);
+    blurred.rgb = lerp(saturated, tint.rgb, tint.a);
 
     const float antialias_threshold = 0.5;
     float mask = saturate(antialias_threshold - quad_sdf(input.position.xy, blur.bounds, blur.corner_radii));

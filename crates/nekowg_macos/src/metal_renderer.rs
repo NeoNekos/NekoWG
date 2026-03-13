@@ -9,7 +9,7 @@ use cocoa::{
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 use nekowg::{
-    AtlasTextureId, BackdropFilter, Background, Bounds, ContentMask, Corners, DevicePixels,
+    AtlasTextureId, BackdropFilter, Background, Bounds, ContentMask, Corners, DevicePixels, Hsla,
     MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
     ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
 };
@@ -157,7 +157,9 @@ pub struct BackdropBlurInstance {
     pub content_mask: Bounds<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub opacity: f32,
-    pub _pad0: [f32; 3],
+    pub saturation: f32,
+    pub _pad0: [f32; 2],
+    pub tint: Hsla,
     pub direction: [f32; 2],
     pub texel_step: [f32; 2],
     pub viewport_size: [f32; 2],
@@ -172,6 +174,8 @@ impl BackdropBlurInstance {
         content_mask: Bounds<ScaledPixels>,
         corner_radii: Corners<ScaledPixels>,
         opacity: f32,
+        tint: Hsla,
+        saturation: f32,
         direction: [f32; 2],
         texel_step: [f32; 2],
         viewport_size: [f32; 2],
@@ -183,7 +187,9 @@ impl BackdropBlurInstance {
             content_mask,
             corner_radii,
             opacity,
-            _pad0: [0.0; 3],
+            saturation,
+            _pad0: [0.0; 2],
+            tint,
             direction,
             texel_step,
             viewport_size,
@@ -198,6 +204,8 @@ impl BackdropBlurInstance {
             bounds,
             bounds,
             Corners::default(),
+            1.0,
+            Hsla::default(),
             1.0,
             [1.0, 0.0],
             [0.0, 0.0],
@@ -1597,7 +1605,13 @@ impl MetalRenderer {
             let scissor_expanded = Self::scissor_from_bounds(expanded_scaled, target_size_u32);
             let scissor_full = Self::scissor_from_bounds(filter.bounds, full_size);
 
-            let (weights0, weights1, step) = Self::gaussian_weights(radius, scale as f32);
+            let passes = Self::blur_passes(radius, scale);
+            let pass_radius = if passes > 1 {
+                radius / (passes as f32).sqrt()
+            } else {
+                radius
+            };
+            let (weights0, weights1, step) = Self::gaussian_weights(pass_radius, scale as f32);
             let texel_step = [
                 step / target_size_f[0].max(1.0),
                 step / target_size_f[1].max(1.0),
@@ -1655,63 +1669,104 @@ impl MetalRenderer {
             let Some(scissor) = scissor_expanded else {
                 continue;
             };
-            let source_texture = down_texture.unwrap_or(main_texture);
-            let blur_instance = BackdropBlurInstance::blur_instance(
-                expanded_scaled,
-                expanded_scaled,
-                Corners::default(),
-                1.0,
-                [1.0, 0.0],
-                texel_step,
-                target_size_f,
-                weights0,
-                weights1,
-            );
-            let ok = self.draw_backdrop_pass(
-                &blur_instance,
-                instance_buffer,
-                instance_offset,
-                command_buffer,
-                &self.backdrop_blur_h_pipeline_state,
-                temp_texture,
-                source_texture,
-                Size {
-                    width: DevicePixels(target_size_u32[0] as i32),
-                    height: DevicePixels(target_size_u32[1] as i32),
-                },
-                Some(scissor),
-            );
-            if !ok {
-                return false;
-            }
-
-            let Some(scissor) = scissor_full else {
-                continue;
+            let mut source_texture = down_texture.unwrap_or(main_texture);
+            let target_size = Size {
+                width: DevicePixels(target_size_u32[0] as i32),
+                height: DevicePixels(target_size_u32[1] as i32),
             };
-            let composite_instance = BackdropBlurInstance::blur_instance(
-                filter.bounds,
-                filter.content_mask.bounds,
-                filter.corner_radii,
-                filter.opacity,
-                [0.0, 1.0],
-                texel_step,
-                full_size_f,
-                weights0,
-                weights1,
-            );
-            let ok = self.draw_backdrop_pass(
-                &composite_instance,
-                instance_buffer,
-                instance_offset,
-                command_buffer,
-                &self.backdrop_blur_composite_pipeline_state,
-                main_texture,
-                temp_texture,
-                viewport_size,
-                Some(scissor),
-            );
-            if !ok {
-                return false;
+
+            for pass_index in 0..passes {
+                let blur_instance = BackdropBlurInstance::blur_instance(
+                    expanded_scaled,
+                    expanded_scaled,
+                    Corners::default(),
+                    1.0,
+                    Hsla::default(),
+                    1.0,
+                    [1.0, 0.0],
+                    texel_step,
+                    target_size_f,
+                    weights0,
+                    weights1,
+                );
+                let ok = self.draw_backdrop_pass(
+                    &blur_instance,
+                    instance_buffer,
+                    instance_offset,
+                    command_buffer,
+                    &self.backdrop_blur_h_pipeline_state,
+                    temp_texture,
+                    source_texture,
+                    target_size,
+                    Some(scissor),
+                );
+                if !ok {
+                    return false;
+                }
+
+                if pass_index + 1 == passes {
+                    let Some(scissor) = scissor_full else {
+                        continue;
+                    };
+                    let composite_instance = BackdropBlurInstance::blur_instance(
+                        filter.bounds,
+                        filter.content_mask.bounds,
+                        filter.corner_radii,
+                        filter.opacity,
+                        filter.tint,
+                        filter.saturation,
+                        [0.0, 1.0],
+                        texel_step,
+                        full_size_f,
+                        weights0,
+                        weights1,
+                    );
+                    let ok = self.draw_backdrop_pass(
+                        &composite_instance,
+                        instance_buffer,
+                        instance_offset,
+                        command_buffer,
+                        &self.backdrop_blur_composite_pipeline_state,
+                        main_texture,
+                        temp_texture,
+                        viewport_size,
+                        Some(scissor),
+                    );
+                    if !ok {
+                        return false;
+                    }
+                } else {
+                    let down_texture =
+                        down_texture.expect("downsample texture missing");
+                    let blur_instance = BackdropBlurInstance::blur_instance(
+                        expanded_scaled,
+                        expanded_scaled,
+                        Corners::default(),
+                        1.0,
+                        Hsla::default(),
+                        1.0,
+                        [0.0, 1.0],
+                        texel_step,
+                        target_size_f,
+                        weights0,
+                        weights1,
+                    );
+                    let ok = self.draw_backdrop_pass(
+                        &blur_instance,
+                        instance_buffer,
+                        instance_offset,
+                        command_buffer,
+                        &self.backdrop_blur_h_pipeline_state,
+                        down_texture,
+                        temp_texture,
+                        target_size,
+                        Some(scissor),
+                    );
+                    if !ok {
+                        return false;
+                    }
+                    source_texture = down_texture;
+                }
             }
         }
 
@@ -1904,6 +1959,16 @@ impl MetalRenderer {
             width: (max_x - min_x) as u64,
             height: (max_y - min_y) as u64,
         })
+    }
+
+    fn blur_passes(radius: f32, scale: u32) -> u32 {
+        if scale == 1 {
+            return 1;
+        }
+        let radius_ds = (radius / scale as f32).max(0.0);
+        let ratio = radius_ds / 8.0;
+        let passes = (ratio * ratio).ceil() as u32;
+        passes.clamp(1, 6)
     }
 
     fn gaussian_weights(radius: f32, scale: f32) -> ([f32; 4], [f32; 4], f32) {

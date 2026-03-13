@@ -728,7 +728,13 @@ impl DirectXRenderer {
             let scissor_expanded = scissor_from_bounds(expanded_scaled, target_width, target_height);
             let scissor_full = scissor_from_bounds(filter.bounds, full_width, full_height);
 
-            let (weights0, weights1, step) = gaussian_weights(radius, scale as f32);
+            let passes = blur_passes(radius, scale);
+            let pass_radius = if passes > 1 {
+                radius / (passes as f32).sqrt()
+            } else {
+                radius
+            };
+            let (weights0, weights1, step) = gaussian_weights(pass_radius, scale as f32);
             let texel_step = [step / target_width as f32, step / target_height as f32];
 
             let (down_rtv, down_srv, temp_rtv, temp_srv) = match scale {
@@ -811,7 +817,9 @@ impl DirectXRenderer {
                     content_mask: expanded_scaled,
                     corner_radii: Corners::default(),
                     opacity: 1.0,
-                    _pad0: [0.0; 3],
+                    saturation: 1.0,
+                    _pad0: [0.0; 2],
+                    tint: Hsla::default(),
                     direction: [1.0, 0.0],
                     texel_step: [0.0, 0.0],
                     viewport_size: [target_width as f32, target_height as f32],
@@ -834,84 +842,129 @@ impl DirectXRenderer {
                 )?;
             }
 
-            let source_srv = down_srv.unwrap_or(main_srv);
+            let mut source_srv = down_srv.unwrap_or(main_srv);
             let Some(scissor) = scissor_expanded else {
                 continue;
             };
-            unsafe {
-                let rtv = Some(temp_rtv.clone());
-                device_context.OMSetRenderTargets(Some(slice::from_ref(&rtv)), None);
-                device_context.RSSetScissorRects(Some(slice::from_ref(&scissor)));
-            }
             let blur_viewport = if scale == 1 {
                 full_viewport
             } else {
                 set_viewport(target_width, target_height)
             };
 
-            let blur_instance = BackdropBlurInstance {
-                bounds: expanded_scaled,
-                content_mask: expanded_scaled,
-                corner_radii: Corners::default(),
-                opacity: 1.0,
-                _pad0: [0.0; 3],
-                direction: [1.0, 0.0],
-                texel_step,
-                viewport_size: [target_width as f32, target_height as f32],
-                _pad1: [0.0; 2],
-                weights0,
-                weights1,
-            };
-            self.pipelines.backdrop_blur_h_pipeline.update_buffer(
-                device,
-                device_context,
-                &[blur_instance],
-            )?;
-            self.pipelines.backdrop_blur_h_pipeline.draw_with_texture(
-                device_context,
-                slice::from_ref(&Some(source_srv.clone())),
-                slice::from_ref(&blur_viewport),
-                slice::from_ref(&self.globals.global_params_buffer),
-                slice::from_ref(&self.globals.sampler),
-                1,
-            )?;
+            for pass_index in 0..passes {
+                unsafe {
+                    let rtv = Some(temp_rtv.clone());
+                    device_context.OMSetRenderTargets(Some(slice::from_ref(&rtv)), None);
+                    device_context.RSSetScissorRects(Some(slice::from_ref(&scissor)));
+                }
 
-            let Some(scissor_full) = scissor_full else {
-                continue;
-            };
-            unsafe {
-                let rtv = Some(main_rtv.clone());
-                device_context.OMSetRenderTargets(Some(slice::from_ref(&rtv)), None);
-                device_context.RSSetScissorRects(Some(slice::from_ref(&scissor_full)));
-            }
-            set_viewport(full_width, full_height);
-
-            let composite_instance = BackdropBlurInstance {
-                bounds: filter.bounds,
-                content_mask: filter.content_mask.bounds,
-                corner_radii: filter.corner_radii,
-                opacity: filter.opacity,
-                _pad0: [0.0; 3],
-                direction: [0.0, 1.0],
-                texel_step,
-                viewport_size: [full_width as f32, full_height as f32],
-                _pad1: [0.0; 2],
-                weights0,
-                weights1,
-            };
-            self.pipelines
-                .backdrop_blur_composite_pipeline
-                .update_buffer(device, device_context, &[composite_instance])?;
-            self.pipelines
-                .backdrop_blur_composite_pipeline
-                .draw_with_texture(
+                let blur_instance = BackdropBlurInstance {
+                    bounds: expanded_scaled,
+                    content_mask: expanded_scaled,
+                    corner_radii: Corners::default(),
+                    opacity: 1.0,
+                    saturation: 1.0,
+                    _pad0: [0.0; 2],
+                    tint: Hsla::default(),
+                    direction: [1.0, 0.0],
+                    texel_step,
+                    viewport_size: [target_width as f32, target_height as f32],
+                    _pad1: [0.0; 2],
+                    weights0,
+                    weights1,
+                };
+                self.pipelines.backdrop_blur_h_pipeline.update_buffer(
+                    device,
                     device_context,
-                    slice::from_ref(&Some(temp_srv.clone())),
-                    slice::from_ref(&full_viewport),
+                    &[blur_instance],
+                )?;
+                self.pipelines.backdrop_blur_h_pipeline.draw_with_texture(
+                    device_context,
+                    slice::from_ref(&Some(source_srv.clone())),
+                    slice::from_ref(&blur_viewport),
                     slice::from_ref(&self.globals.global_params_buffer),
                     slice::from_ref(&self.globals.sampler),
                     1,
                 )?;
+
+                if pass_index + 1 == passes {
+                    let Some(scissor_full) = scissor_full else {
+                        continue;
+                    };
+                    unsafe {
+                        let rtv = Some(main_rtv.clone());
+                        device_context.OMSetRenderTargets(Some(slice::from_ref(&rtv)), None);
+                        device_context.RSSetScissorRects(Some(slice::from_ref(&scissor_full)));
+                    }
+                    set_viewport(full_width, full_height);
+
+                    let composite_instance = BackdropBlurInstance {
+                        bounds: filter.bounds,
+                        content_mask: filter.content_mask.bounds,
+                        corner_radii: filter.corner_radii,
+                        opacity: filter.opacity,
+                        saturation: filter.saturation,
+                        _pad0: [0.0; 2],
+                        tint: filter.tint,
+                        direction: [0.0, 1.0],
+                        texel_step,
+                        viewport_size: [full_width as f32, full_height as f32],
+                        _pad1: [0.0; 2],
+                        weights0,
+                        weights1,
+                    };
+                    self.pipelines
+                        .backdrop_blur_composite_pipeline
+                        .update_buffer(device, device_context, &[composite_instance])?;
+                    self.pipelines
+                        .backdrop_blur_composite_pipeline
+                        .draw_with_texture(
+                            device_context,
+                            slice::from_ref(&Some(temp_srv.clone())),
+                            slice::from_ref(&full_viewport),
+                            slice::from_ref(&self.globals.global_params_buffer),
+                            slice::from_ref(&self.globals.sampler),
+                            1,
+                        )?;
+                } else {
+                    let down_rtv = down_rtv.expect("missing backdrop down rtv");
+                    let down_srv = down_srv.expect("missing backdrop down srv");
+                    unsafe {
+                        let rtv = Some(down_rtv.clone());
+                        device_context.OMSetRenderTargets(Some(slice::from_ref(&rtv)), None);
+                        device_context.RSSetScissorRects(Some(slice::from_ref(&scissor)));
+                    }
+                    self.pipelines.backdrop_blur_h_pipeline.update_buffer(
+                        device,
+                        device_context,
+                        &[BackdropBlurInstance {
+                            bounds: expanded_scaled,
+                            content_mask: expanded_scaled,
+                            corner_radii: Corners::default(),
+                            opacity: 1.0,
+                            saturation: 1.0,
+                            _pad0: [0.0; 2],
+                            tint: Hsla::default(),
+                            direction: [0.0, 1.0],
+                            texel_step,
+                            viewport_size: [target_width as f32, target_height as f32],
+                            _pad1: [0.0; 2],
+                            weights0,
+                            weights1,
+                        }],
+                    )?;
+                    self.pipelines.backdrop_blur_h_pipeline.draw_with_texture(
+                        device_context,
+                        slice::from_ref(&Some(temp_srv.clone())),
+                        slice::from_ref(&blur_viewport),
+                        slice::from_ref(&self.globals.global_params_buffer),
+                        slice::from_ref(&self.globals.sampler),
+                        1,
+                    )?;
+                    source_srv = down_srv;
+                }
+            }
         }
 
         unsafe {
@@ -959,7 +1012,9 @@ impl DirectXRenderer {
             },
             corner_radii: Corners::default(),
             opacity: 1.0,
-            _pad0: [0.0; 3],
+            saturation: 1.0,
+            _pad0: [0.0; 2],
+            tint: Hsla::default(),
             direction: [1.0, 0.0],
             texel_step: [0.0, 0.0],
             viewport_size: [self.width as f32, self.height as f32],
@@ -1651,7 +1706,9 @@ struct BackdropBlurInstance {
     content_mask: Bounds<ScaledPixels>,
     corner_radii: Corners<ScaledPixels>,
     opacity: f32,
-    _pad0: [f32; 3],
+    saturation: f32,
+    _pad0: [f32; 2],
+    tint: Hsla,
     direction: [f32; 2],
     texel_step: [f32; 2],
     viewport_size: [f32; 2],
@@ -1958,6 +2015,16 @@ fn gaussian_weights(radius: f32, scale: f32) -> ([f32; 4], [f32; 4], f32) {
         [weights[4], 0.0, 0.0, 0.0],
         step,
     )
+}
+
+fn blur_passes(radius: f32, scale: u32) -> u32 {
+    if scale == 1 {
+        return 1;
+    }
+    let radius_ds = (radius / scale as f32).max(0.0);
+    let ratio = radius_ds / 8.0;
+    let passes = (ratio * ratio).ceil() as u32;
+    passes.clamp(1, 6)
 }
 
 #[inline]

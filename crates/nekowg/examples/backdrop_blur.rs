@@ -41,11 +41,12 @@ impl Render for BackdropBlurDemo {
                     .top_48()
                     .w(px(300.0))
                     .h(px(180.0))
-                    .bg(nekowg::black().opacity(0.55))
-                    .backdrop_blur_md()
+                    .backdrop_blur_3xl()
+                    .backdrop_tint(nekowg::white().opacity(0.08))
+                    .backdrop_saturation(1.80)
                     .p_3()
                     .text_sm()
-                    .child("backdrop_blur_md"),
+                    .child("backdrop_blur_3xl"),
             )
     }
 }

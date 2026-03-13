@@ -585,6 +585,8 @@ pub struct BackdropFilter {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub opacity: f32,
+    pub tint: Hsla,
+    pub saturation: f32,
 }
 
 impl From<BackdropFilter> for Primitive {

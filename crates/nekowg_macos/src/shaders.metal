@@ -988,6 +988,11 @@ fragment float4 backdrop_blur_composite_fragment(
   float4 blurred = gaussian_sample_sum(input_texture, input.uv, blur.direction,
                                        blur.texel_step, blur.weights0,
                                        blur.weights1);
+  float saturation = max(0.0f, blur.saturation);
+  float luma = dot(blurred.rgb, float3(0.2126f, 0.7152f, 0.0722f));
+  float3 saturated = mix(float3(luma), blurred.rgb, saturation);
+  float4 tint = hsla_to_rgba(blur.tint);
+  blurred.rgb = mix(saturated, tint.rgb, tint.a);
 
   const float antialias_threshold = 0.5;
   float mask = saturate(antialias_threshold -

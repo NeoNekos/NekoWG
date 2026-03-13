@@ -2,7 +2,7 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use log::warn;
 use nekowg::{
-    AtlasTextureId, BackdropFilter, Background, Bounds, Corners, DevicePixels, GpuSpecs,
+    AtlasTextureId, BackdropFilter, Background, Bounds, Corners, DevicePixels, GpuSpecs, Hsla,
     MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
     Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios, point, size,
 };
@@ -75,7 +75,9 @@ struct BackdropBlurInstance {
     content_mask: Bounds<ScaledPixels>,
     corner_radii: Corners<ScaledPixels>,
     opacity: f32,
-    _pad0: [f32; 3],
+    saturation: f32,
+    _pad0: [f32; 2],
+    tint: Hsla,
     direction: [f32; 2],
     texel_step: [f32; 2],
     viewport_size: [f32; 2],
@@ -90,6 +92,8 @@ impl BackdropBlurInstance {
         content_mask: Bounds<ScaledPixels>,
         corner_radii: Corners<ScaledPixels>,
         opacity: f32,
+        tint: Hsla,
+        saturation: f32,
         direction: [f32; 2],
         texel_step: [f32; 2],
         viewport_size: [f32; 2],
@@ -101,7 +105,9 @@ impl BackdropBlurInstance {
             content_mask,
             corner_radii,
             opacity,
-            _pad0: [0.0; 3],
+            saturation,
+            _pad0: [0.0; 2],
+            tint,
             direction,
             texel_step,
             viewport_size,
@@ -116,6 +122,8 @@ impl BackdropBlurInstance {
             bounds,
             bounds,
             Corners::default(),
+            1.0,
+            Hsla::default(),
             1.0,
             [1.0, 0.0],
             [0.0, 0.0],
@@ -1823,6 +1831,16 @@ impl WgpuRenderer {
         ))
     }
 
+    fn blur_passes(radius: f32, scale: u32) -> u32 {
+        if scale == 1 {
+            return 1;
+        }
+        let radius_ds = (radius / scale as f32).max(0.0);
+        let ratio = radius_ds / 8.0;
+        let passes = (ratio * ratio).ceil() as u32;
+        passes.clamp(1, 6)
+    }
+
     fn gaussian_weights(radius: f32, scale: f32) -> ([f32; 4], [f32; 4], f32) {
         let radius_ds = (radius / scale).max(0.0);
         let step = (radius_ds / 4.0).max(1.0);
@@ -2019,7 +2037,13 @@ impl WgpuRenderer {
             let scissor_expanded = Self::scissor_from_bounds(expanded_scaled, target_size_u32);
             let scissor_full = Self::scissor_from_bounds(filter.bounds, full_size_u32);
 
-            let (weights0, weights1, step) = Self::gaussian_weights(radius, scale as f32);
+            let passes = Self::blur_passes(radius, scale);
+            let pass_radius = if passes > 1 {
+                radius / (passes as f32).sqrt()
+            } else {
+                radius
+            };
+            let (weights0, weights1, step) = Self::gaussian_weights(pass_radius, scale as f32);
             let texel_step = [step / target_size[0], step / target_size[1]];
 
             let (down_view, temp_view) = match scale {
@@ -2093,93 +2117,147 @@ impl WgpuRenderer {
                 }
             }
 
-            let source_view = down_view.unwrap_or(main_view);
+            let mut source_view = down_view.unwrap_or(main_view);
             let Some(scissor) = scissor_expanded else {
                 continue;
             };
-            let blur_instance = BackdropBlurInstance::blur_instance(
-                expanded_scaled,
-                expanded_scaled,
-                Corners::default(),
-                1.0,
-                [1.0, 0.0],
-                texel_step,
-                target_size,
-                weights0,
-                weights1,
-            );
-            let blur_instances = [blur_instance];
-            let blur_data = unsafe { Self::instance_bytes(&blur_instances) };
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("backdrop_blur_h"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: temp_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    ..Default::default()
-                });
-                let ok = self.draw_instances_with_texture_scissored(
-                    blur_data,
-                    1,
-                    source_view,
-                    &resources.pipelines.backdrop_blur_h,
-                    instance_offset,
-                    &mut pass,
-                    Some(scissor),
+            for pass_index in 0..passes {
+                let blur_instance = BackdropBlurInstance::blur_instance(
+                    expanded_scaled,
+                    expanded_scaled,
+                    Corners::default(),
+                    1.0,
+                    Hsla::default(),
+                    1.0,
+                    [1.0, 0.0],
+                    texel_step,
+                    target_size,
+                    weights0,
+                    weights1,
                 );
-                if !ok {
-                    return false;
+                let blur_instances = [blur_instance];
+                let blur_data = unsafe { Self::instance_bytes(&blur_instances) };
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("backdrop_blur_h"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: temp_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    let ok = self.draw_instances_with_texture_scissored(
+                        blur_data,
+                        1,
+                        source_view,
+                        &resources.pipelines.backdrop_blur_h,
+                        instance_offset,
+                        &mut pass,
+                        Some(scissor),
+                    );
+                    if !ok {
+                        return false;
+                    }
                 }
-            }
 
-            let Some(scissor_full) = scissor_full else {
-                continue;
-            };
-            let composite_instance = BackdropBlurInstance::blur_instance(
-                filter.bounds,
-                filter.content_mask.bounds,
-                filter.corner_radii,
-                filter.opacity,
-                [0.0, 1.0],
-                texel_step,
-                full_size,
-                weights0,
-                weights1,
-            );
-            let composite_instances = [composite_instance];
-            let composite_data = unsafe { Self::instance_bytes(&composite_instances) };
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("backdrop_blur_composite"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: main_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-            let ok = self.draw_instances_with_texture_scissored(
-                composite_data,
-                1,
-                temp_view,
-                &resources.pipelines.backdrop_blur_composite,
-                instance_offset,
-                &mut pass,
-                Some(scissor_full),
-            );
-            if !ok {
-                return false;
+                if pass_index + 1 == passes {
+                    let Some(scissor_full) = scissor_full else {
+                        continue;
+                    };
+                    let composite_instance = BackdropBlurInstance::blur_instance(
+                        filter.bounds,
+                        filter.content_mask.bounds,
+                        filter.corner_radii,
+                        filter.opacity,
+                        filter.tint,
+                        filter.saturation,
+                        [0.0, 1.0],
+                        texel_step,
+                        full_size,
+                        weights0,
+                        weights1,
+                    );
+                    let composite_instances = [composite_instance];
+                    let composite_data = unsafe { Self::instance_bytes(&composite_instances) };
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("backdrop_blur_composite"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: main_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    let ok = self.draw_instances_with_texture_scissored(
+                        composite_data,
+                        1,
+                        temp_view,
+                        &resources.pipelines.backdrop_blur_composite,
+                        instance_offset,
+                        &mut pass,
+                        Some(scissor_full),
+                    );
+                    if !ok {
+                        return false;
+                    }
+                } else {
+                    let Some(down_view) = down_view else {
+                        return false;
+                    };
+                    let blur_instance = BackdropBlurInstance::blur_instance(
+                        expanded_scaled,
+                        expanded_scaled,
+                        Corners::default(),
+                        1.0,
+                        Hsla::default(),
+                        1.0,
+                        [0.0, 1.0],
+                        texel_step,
+                        target_size,
+                        weights0,
+                        weights1,
+                    );
+                    let blur_instances = [blur_instance];
+                    let blur_data = unsafe { Self::instance_bytes(&blur_instances) };
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("backdrop_blur_v"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: down_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    let ok = self.draw_instances_with_texture_scissored(
+                        blur_data,
+                        1,
+                        temp_view,
+                        &resources.pipelines.backdrop_blur_h,
+                        instance_offset,
+                        &mut pass,
+                        Some(scissor),
+                    );
+                    if !ok {
+                        return false;
+                    }
+                    source_view = down_view;
+                }
             }
         }
 

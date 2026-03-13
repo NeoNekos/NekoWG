@@ -253,6 +253,10 @@ pub struct Style {
 
     /// Blur the content behind this element, like CSS `backdrop-filter: blur(...)`.
     pub backdrop_blur: Option<AbsoluteLength>,
+    /// Tint color applied to the blurred backdrop.
+    pub backdrop_tint: Option<Hsla>,
+    /// Saturation multiplier applied to the blurred backdrop (1.0 = unchanged).
+    pub backdrop_saturation: Option<f32>,
 
     /// The text style of this element
     #[refineable]
@@ -639,7 +643,13 @@ impl Style {
         window.paint_shadows(bounds, corner_radii, &self.box_shadow);
 
         if let Some(blur_radius) = self.backdrop_blur {
-            window.paint_backdrop_blur(bounds, corner_radii, blur_radius);
+            window.paint_backdrop_blur(
+                bounds,
+                corner_radii,
+                blur_radius,
+                self.backdrop_tint.unwrap_or_default(),
+                self.backdrop_saturation.unwrap_or(1.0),
+            );
         }
 
         let background_color = self.background.as_ref().and_then(Fill::color);
@@ -793,6 +803,8 @@ impl Default for Style {
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
             backdrop_blur: None,
+            backdrop_tint: None,
+            backdrop_saturation: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
