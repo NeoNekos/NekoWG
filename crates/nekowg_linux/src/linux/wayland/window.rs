@@ -30,10 +30,11 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use nekowg::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
+    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs,
+    GpuSurfaceExecutionInput, Modifiers, PaintSurface, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, ResizeEdge, Scene, Size, Tiling, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
     WindowDecorations, WindowKind, WindowParams, layer_shell::LayerShellNotSupportedError, px,
     size,
 };
@@ -1400,6 +1401,15 @@ impl PlatformWindow for WaylandWindow {
         }
 
         state.renderer.draw(scene);
+    }
+
+    fn paint_gpu_surface(&self, input: GpuSurfaceExecutionInput<'_>) -> Option<PaintSurface> {
+        self.borrow_mut()
+            .renderer
+            .paint_gpu_surface(input)
+            .map_err(|err| log::error!("wayland wgpu surface execution failed: {err:#}"))
+            .ok()
+            .flatten()
     }
 
     fn completed_frame(&self) {

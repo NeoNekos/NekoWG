@@ -1100,7 +1100,8 @@ fn fs_backdrop_blur_composite(input: BackdropBlurVarying) -> @location(0) vec4<f
     let luma = dot(blurred.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
     let saturated = mix(vec3<f32>(luma), blurred.rgb, saturation);
     let tint = hsla_to_rgba(blur.tint);
-    blurred.rgb = mix(saturated, tint.rgb, tint.a);
+    let tinted_rgb = mix(saturated, tint.rgb, tint.a);
+    blurred = vec4<f32>(tinted_rgb, blurred.a);
 
     let antialias_threshold = 0.5;
     let mask = saturate(antialias_threshold - quad_sdf(input.position.xy, blur.bounds, blur.corner_radii));
@@ -1382,6 +1383,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    corner_radii: vec4<f32>,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
@@ -1424,6 +1426,29 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         textureSampleLevel(t_y, s_surface, input.texture_position, 0.0).r,
         textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
         1.0);
+    let corner_radii = Corners(
+        surface_locals.corner_radii.x,
+        surface_locals.corner_radii.y,
+        surface_locals.corner_radii.z,
+        surface_locals.corner_radii.w,
+    );
+    let mask = saturate(0.5 - quad_sdf(input.position.xy, surface_locals.bounds, corner_radii));
+    let color = ycbcr_to_RGB * y_cb_cr;
+    return blend_color(color, mask);
+}
 
-    return ycbcr_to_RGB * y_cb_cr;
+@fragment
+fn fs_gpu_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    let corner_radii = Corners(
+        surface_locals.corner_radii.x,
+        surface_locals.corner_radii.y,
+        surface_locals.corner_radii.z,
+        surface_locals.corner_radii.w,
+    );
+    let mask = saturate(0.5 - quad_sdf(input.position.xy, surface_locals.bounds, corner_radii));
+    let color = textureSampleLevel(t_y, s_surface, input.texture_position, 0.0);
+    return blend_color(color, mask);
 }

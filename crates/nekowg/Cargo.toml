@@ -178,6 +178,26 @@ name = "gpu_surface"
 path = "examples/gpu_surface.rs"
 
 [[example]]
+name = "gpu_surface_fluid"
+path = "examples/gpu_surface_fluid.rs"
+
+[[example]]
+name = "gpu_surface_clipped"
+path = "examples/gpu_surface_clipped.rs"
+
+[[example]]
+name = "gpu_surface_resize_rebuild"
+path = "examples/gpu_surface_resize_rebuild.rs"
+
+[[example]]
+name = "gpu_surface_transient_pool"
+path = "examples/gpu_surface_transient_pool.rs"
+
+[[example]]
+name = "gpu_surface_multi_surface_stress"
+path = "examples/gpu_surface_multi_surface_stress.rs"
+
+[[example]]
 name = "input"
 path = "examples/input.rs"
 
