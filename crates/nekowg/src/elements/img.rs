@@ -1,8 +1,9 @@
 use crate::{
     AnyElement, AnyImageCache, App, Asset, AssetLogger, Bounds, DefiniteLength, DevicePixels,
     Element, ElementId, Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId,
-    InteractiveElement, Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels, RenderImage,
-    Resource, SharedString, SharedUri, StyleRefinement, Styled, Task, Window, px, size,
+    InteractiveElement, Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels,
+    RenderImage, Resource, SharedString, SharedUri, StyleRefinement, Styled, Task, Window, px,
+    size,
 };
 use anyhow::Result;
 
@@ -321,11 +322,7 @@ impl AnimatedDecoderState {
         }
     }
 
-    fn ensure_frame(
-        &mut self,
-        frame_index: usize,
-        data: &RenderImage,
-    ) -> Option<Arc<[u8]>> {
+    fn ensure_frame(&mut self, frame_index: usize, data: &RenderImage) -> Option<Arc<[u8]>> {
         if let Some(bytes) = data.bytes(frame_index) {
             return Some(bytes);
         }
@@ -530,9 +527,7 @@ impl Element for Img {
                                     }
 
                                     if state.frame_index != previous_frame {
-                                        window
-                                            .drop_image_frame(data.id, previous_frame)
-                                            .log_err();
+                                        window.drop_image_frame(data.id, previous_frame).log_err();
                                     }
 
                                     if let Some(decoder) = &mut state.animation_decoder {
@@ -858,11 +853,14 @@ impl Asset for ImageAssetLoader {
             let bytes: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
 
             if let Ok(format) = image::guess_format(&bytes) {
-                let mut collect_frames = |mut frames: Frames<'static>| -> Result<(
-                    Vec<(crate::Size<crate::DevicePixels>, image::Delay)>,
-                    Option<Arc<[u8]>>,
-                    bool,
-                ), ImageCacheError> {
+                let mut collect_frames = |mut frames: Frames<'static>| -> Result<
+                    (
+                        Vec<(crate::Size<crate::DevicePixels>, image::Delay)>,
+                        Option<Arc<[u8]>>,
+                        bool,
+                    ),
+                    ImageCacheError,
+                > {
                     let mut metadata = Vec::new();
                     let mut first_pixels: Option<Arc<[u8]>> = None;
                     let mut total_bytes: usize = 0;
@@ -947,7 +945,8 @@ impl Asset for ImageAssetLoader {
                                 pixel.swap(0, 2);
                             }
 
-                            let mut image = RenderImage::new(SmallVec::from_elem(Frame::new(data), 1));
+                            let mut image =
+                                RenderImage::new(SmallVec::from_elem(Frame::new(data), 1));
                             image = image.with_source(crate::RenderImageSource::Raster {
                                 format,
                                 bytes: bytes.clone(),

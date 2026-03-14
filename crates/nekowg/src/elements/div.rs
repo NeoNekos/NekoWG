@@ -1810,8 +1810,8 @@ impl Interactivity {
                 }
 
                 window.with_text_style(style.text_style().cloned(), |window| {
-                    window.with_content_mask(
-                        style.overflow_mask(bounds, window.rem_size()),
+                    window.with_clip_mask(
+                        style.overflow_clip_mask(bounds, window.rem_size()),
                         |window| {
                             let hitbox = if self.should_insert_hitbox(&style, window, cx) {
                                 Some(window.insert_hitbox(bounds, self.hitbox_behavior))
@@ -1963,8 +1963,8 @@ impl Interactivity {
                 window.with_element_opacity(style.opacity, |window| {
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
-                            window.with_content_mask(
-                                style.overflow_mask(bounds, window.rem_size()),
+                            window.with_clip_mask(
+                                style.overflow_clip_mask(bounds, window.rem_size()),
                                 |window| {
                                     window.with_tab_group(tab_group, |window| {
                                         if let Some(hitbox) = hitbox {

@@ -3,23 +3,23 @@ use crate::Inspector;
 use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App,
     AppContext, Arena, Asset, AsyncWindowContext, AvailableSpace, BackdropFilter, Background,
-    BorderStyle, Bounds, BoxShadow, Capslock,
-    Context, Corners, CursorStyle, DEFAULT_IMAGE_CACHE_BYTES, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, LruImageCache, Modifiers, ModifiersChangedEvent,
-    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
-    transparent_black,
+    BorderStyle, Bounds, BoxShadow, Capslock, Context, Corners, CursorStyle,
+    DEFAULT_IMAGE_CACHE_BYTES, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId,
+    DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId,
+    Global, GlobalElementId, GlyphId, GpuRecordedGraph, GpuSpecs, GpuSurfaceExecutionInput,
+    GpuTextureDesc, GpuTextureHandle, Hsla, InputHandler, IsZero, KeyBinding, KeyContext,
+    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, LruImageCache,
+    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
+    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    point, prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -917,7 +917,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
-    pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
+    pub(crate) content_mask_stack: Vec<ClipMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
@@ -1473,6 +1473,12 @@ pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
     pub bounds: Bounds<P>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClipMask<P: Clone + Debug + Default + PartialEq> {
+    pub bounds: Bounds<P>,
+    pub corner_radii: Corners<P>,
+}
+
 impl ContentMask<Pixels> {
     /// Scale the content mask's pixel units by the given scaling factor.
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
@@ -1486,6 +1492,75 @@ impl ContentMask<Pixels> {
         let bounds = self.bounds.intersect(&other.bounds);
         ContentMask { bounds }
     }
+}
+
+impl ClipMask<Pixels> {
+    pub fn scale(&self, factor: f32) -> ClipMask<ScaledPixels> {
+        ClipMask {
+            bounds: self.bounds.scale(factor),
+            corner_radii: self.corner_radii.scale(factor),
+        }
+    }
+
+    pub fn intersect(&self, other: &Self) -> Self {
+        let bounds = self.bounds.intersect(&other.bounds);
+        let corner_radii = if pixels_bounds_nearly_equal(bounds, self.bounds)
+            && pixels_bounds_nearly_equal(bounds, other.bounds)
+        {
+            max_corners(self.corner_radii, other.corner_radii)
+        } else if pixels_bounds_nearly_equal(bounds, self.bounds) {
+            self.corner_radii
+        } else if pixels_bounds_nearly_equal(bounds, other.bounds) {
+            other.corner_radii
+        } else {
+            Corners::default()
+        };
+
+        ClipMask {
+            bounds,
+            corner_radii: corner_radii.clamp_radii_for_quad_size(bounds.size),
+        }
+    }
+}
+
+impl<P: Clone + Debug + Default + PartialEq> ClipMask<P> {
+    pub fn content_mask(&self) -> ContentMask<P> {
+        ContentMask {
+            bounds: self.bounds.clone(),
+        }
+    }
+}
+
+impl From<ContentMask<Pixels>> for ClipMask<Pixels> {
+    fn from(value: ContentMask<Pixels>) -> Self {
+        Self {
+            bounds: value.bounds,
+            corner_radii: Corners::default(),
+        }
+    }
+}
+
+fn max_corners<T>(a: Corners<T>, b: Corners<T>) -> Corners<T>
+where
+    T: Clone + Debug + Default + PartialEq + Ord,
+{
+    Corners {
+        top_left: a.top_left.max(b.top_left),
+        top_right: a.top_right.max(b.top_right),
+        bottom_right: a.bottom_right.max(b.bottom_right),
+        bottom_left: a.bottom_left.max(b.bottom_left),
+    }
+}
+
+pub(crate) fn pixels_bounds_nearly_equal(a: Bounds<Pixels>, b: Bounds<Pixels>) -> bool {
+    nearly_equal(a.origin.x.as_f32(), b.origin.x.as_f32())
+        && nearly_equal(a.origin.y.as_f32(), b.origin.y.as_f32())
+        && nearly_equal(a.size.width.as_f32(), b.size.width.as_f32())
+        && nearly_equal(a.size.height.as_f32(), b.size.height.as_f32())
+}
+
+fn nearly_equal(a: f32, b: f32) -> bool {
+    (a - b).abs() <= 0.01
 }
 
 impl Window {
@@ -2672,9 +2747,18 @@ impl Window {
         mask: Option<ContentMask<Pixels>>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        self.with_clip_mask(mask.map(ClipMask::from), f)
+    }
+
+    #[inline]
+    pub(crate) fn with_clip_mask<R>(
+        &mut self,
+        mask: Option<ClipMask<Pixels>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
-            let mask = mask.intersect(&self.content_mask());
+            let mask = mask.intersect(&self.clip_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
@@ -2836,14 +2920,20 @@ impl Window {
     /// Obtain the current content mask. This method should only be called during element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
+        self.clip_mask().content_mask()
+    }
+
+    pub(crate) fn clip_mask(&self) -> ClipMask<Pixels> {
+        self.invalidator.debug_assert_paint_or_prepaint();
         self.content_mask_stack
             .last()
             .cloned()
-            .unwrap_or_else(|| ContentMask {
+            .unwrap_or_else(|| ClipMask {
                 bounds: Bounds {
                     origin: Point::default(),
                     size: self.viewport_size,
                 },
+                corner_radii: Corners::default(),
             })
     }
 
@@ -3553,8 +3643,56 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
+            corner_radii: Default::default(),
             image_buffer,
         });
+    }
+
+    pub(crate) fn paint_gpu_surface(
+        &mut self,
+        surface_id: u64,
+        bounds: Bounds<Pixels>,
+        graph: &GpuRecordedGraph,
+        frame: Option<&crate::GpuFrameContext>,
+        textures: &std::collections::HashMap<GpuTextureHandle, GpuTextureDesc>,
+        buffers: &std::collections::HashMap<crate::GpuBufferHandle, crate::GpuBufferDesc>,
+        samplers: &std::collections::HashMap<crate::GpuSamplerHandle, crate::GpuSamplerDesc>,
+        render_programs: &std::collections::HashMap<
+            crate::GpuRenderProgramHandle,
+            crate::GpuRenderProgramDesc,
+        >,
+        compute_programs: &std::collections::HashMap<
+            crate::GpuComputeProgramHandle,
+            crate::GpuComputeProgramDesc,
+        >,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let clip_mask = self.clip_mask().scale(scale_factor);
+        let content_mask = clip_mask.content_mask();
+        let corner_radii = clip_mask
+            .corner_radii
+            .clamp_radii_for_quad_size(content_mask.bounds.size);
+        let input = GpuSurfaceExecutionInput {
+            surface_id,
+            bounds,
+            content_mask,
+            corner_radii,
+            scale_factor,
+            graph,
+            frame,
+            textures,
+            buffers,
+            samplers,
+            render_programs,
+            compute_programs,
+        };
+
+        if let Some(surface) = self.platform_window.paint_gpu_surface(input) {
+            self.next_frame.scene.insert_primitive(surface);
+        }
     }
 
     /// Removes an image from the sprite atlas.
@@ -3572,11 +3710,7 @@ impl Window {
     }
 
     /// Removes a single image frame from the sprite atlas.
-    pub fn drop_image_frame(
-        &mut self,
-        image_id: crate::ImageId,
-        frame_index: usize,
-    ) -> Result<()> {
+    pub fn drop_image_frame(&mut self, image_id: crate::ImageId, frame_index: usize) -> Result<()> {
         let params = RenderImageParams {
             image_id,
             frame_index,

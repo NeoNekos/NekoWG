@@ -1188,13 +1188,23 @@ impl WgpuRenderer {
 
         let resources = self.resources_mut();
 
-        let (main_t, main_v) =
-            Self::create_backdrop_texture(&resources.device, format, width, height, "backdrop_main");
+        let (main_t, main_v) = Self::create_backdrop_texture(
+            &resources.device,
+            format,
+            width,
+            height,
+            "backdrop_main",
+        );
         resources.backdrop_main_texture = Some(main_t);
         resources.backdrop_main_view = Some(main_v);
 
-        let (temp_t, temp_v) =
-            Self::create_backdrop_texture(&resources.device, format, width, height, "backdrop_temp");
+        let (temp_t, temp_v) = Self::create_backdrop_texture(
+            &resources.device,
+            format,
+            width,
+            height,
+            "backdrop_temp",
+        );
         resources.backdrop_temp_texture = Some(temp_t);
         resources.backdrop_temp_view = Some(temp_v);
 
@@ -1546,7 +1556,10 @@ impl WgpuRenderer {
                     };
                     let instance = BackdropBlurInstance::blit_instance(
                         full_bounds,
-                        [self.surface_config.width as f32, self.surface_config.height as f32],
+                        [
+                            self.surface_config.width as f32,
+                            self.surface_config.height as f32,
+                        ],
                     );
                     self.blit_backdrop_to_frame(
                         &mut encoder,
@@ -2018,9 +2031,7 @@ impl WgpuRenderer {
             };
 
             let kernel = (radius * 1.5).ceil();
-            let expanded_bounds = filter
-                .bounds
-                .dilate(ScaledPixels::from(kernel + 2.0));
+            let expanded_bounds = filter.bounds.dilate(ScaledPixels::from(kernel + 2.0));
             let expanded_scaled = if scale == 1 {
                 expanded_bounds
             } else {

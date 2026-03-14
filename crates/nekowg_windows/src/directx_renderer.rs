@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeSet, HashMap},
     slice,
     sync::{Arc, OnceLock},
 };
@@ -16,7 +17,7 @@ use windows::{
             Dxgi::{Common::*, *},
         },
     },
-    core::Interface,
+    core::{Interface, PCSTR},
 };
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
@@ -52,6 +53,8 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+    gpu_surfaces: HashMap<u64, DirectXGpuSurfaceState>,
+    frame_serial: u64,
 }
 
 /// Direct3D objects
@@ -112,17 +115,717 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    surface_pipeline: PipelineState<SurfaceSprite>,
 }
 
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    surface_sampler: Option<ID3D11SamplerState>,
 }
 
 struct DirectComposition {
     comp_device: IDCompositionDevice,
     comp_target: IDCompositionTarget,
     comp_visual: IDCompositionVisual,
+}
+
+struct DirectXGpuSurfaceState {
+    textures: HashMap<GpuTextureHandle, DirectXGpuSurfaceTexture>,
+    texture_pool: DirectXGpuSurfaceTexturePool<DirectXGpuSurfaceTexture>,
+    buffers: HashMap<GpuBufferHandle, DirectXGpuSurfaceBuffer>,
+    samplers: HashMap<GpuSamplerHandle, DirectXGpuSurfaceSampler>,
+    render_programs: HashMap<GpuRenderProgramHandle, DirectXGpuSurfaceRenderProgram>,
+    compute_programs: HashMap<GpuComputeProgramHandle, DirectXGpuSurfaceComputeProgram>,
+    frame_uniform_buffer: ID3D11Buffer,
+    last_used_frame: u64,
+}
+
+struct DirectXGpuSurfaceTexture {
+    desc: GpuTextureDesc,
+    _texture: ID3D11Texture2D,
+    render_target_view: Option<ID3D11RenderTargetView>,
+    shader_resource_view: Option<ID3D11ShaderResourceView>,
+    unordered_access_view: Option<ID3D11UnorderedAccessView>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DirectXGpuSurfaceTexturePoolKey {
+    extent: GpuExtent,
+    format: GpuTextureFormat,
+    sampled: bool,
+    storage: bool,
+    render_attachment: bool,
+    copy_src: bool,
+    copy_dst: bool,
+}
+
+impl From<&GpuTextureDesc> for DirectXGpuSurfaceTexturePoolKey {
+    fn from(desc: &GpuTextureDesc) -> Self {
+        Self {
+            extent: desc.extent,
+            format: desc.format,
+            sampled: desc.sampled,
+            storage: desc.storage,
+            render_attachment: desc.render_attachment,
+            copy_src: desc.copy_src,
+            copy_dst: desc.copy_dst,
+        }
+    }
+}
+
+struct DirectXGpuSurfaceTexturePool<T> {
+    textures: HashMap<DirectXGpuSurfaceTexturePoolKey, Vec<T>>,
+}
+
+impl<T> DirectXGpuSurfaceTexturePool<T> {
+    fn recycle(&mut self, key: DirectXGpuSurfaceTexturePoolKey, texture: T) {
+        self.textures.entry(key).or_default().push(texture);
+    }
+
+    fn take(&mut self, desc: &GpuTextureDesc) -> Option<T> {
+        let key = DirectXGpuSurfaceTexturePoolKey::from(desc);
+        let mut value = None;
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.textures.entry(key) {
+            value = entry.get_mut().pop();
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
+        value
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.textures.values().map(Vec::len).sum()
+    }
+}
+
+impl<T> Default for DirectXGpuSurfaceTexturePool<T> {
+    fn default() -> Self {
+        Self {
+            textures: HashMap::default(),
+        }
+    }
+}
+
+struct DirectXGpuSurfaceRenderProgram {
+    desc: GpuRenderProgramDesc,
+    vertex: ID3D11VertexShader,
+    fragment: ID3D11PixelShader,
+    bindings: Vec<DirectXGpuSurfaceProgramBinding>,
+}
+
+struct DirectXGpuSurfaceComputeProgram {
+    desc: GpuComputeProgramDesc,
+    compute: ID3D11ComputeShader,
+    bindings: Vec<DirectXGpuSurfaceProgramBinding>,
+}
+
+struct DirectXGpuSurfaceBuffer {
+    desc: GpuBufferDesc,
+    buffer: ID3D11Buffer,
+    data: Vec<u8>,
+    shader_resource_view: Option<ID3D11ShaderResourceView>,
+    unordered_access_view: Option<ID3D11UnorderedAccessView>,
+}
+
+struct DirectXGpuSurfaceSampler {
+    desc: GpuSamplerDesc,
+    sampler: ID3D11SamplerState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectXGpuSurfaceProgramBindingKind {
+    UniformBuffer,
+    StorageBufferReadOnly,
+    StorageBufferReadWrite,
+    SampledTexture,
+    StorageTexture,
+    Sampler,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectXGpuSurfaceProgramBinding {
+    slot: u32,
+    kind: DirectXGpuSurfaceProgramBindingKind,
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct GpuSurfaceFrameUniform {
+    metrics: [f32; 4],
+    extent_cursor: [f32; 4],
+    surface_cursor: [f32; 4],
+}
+
+impl DirectXGpuSurfaceState {
+    fn new(device: &ID3D11Device) -> Result<Self> {
+        Ok(Self {
+            textures: HashMap::default(),
+            texture_pool: DirectXGpuSurfaceTexturePool::default(),
+            buffers: HashMap::default(),
+            samplers: HashMap::default(),
+            render_programs: HashMap::default(),
+            compute_programs: HashMap::default(),
+            frame_uniform_buffer: create_constant_buffer(
+                device,
+                std::mem::size_of::<GpuSurfaceFrameUniform>(),
+            )?,
+            last_used_frame: 0,
+        })
+    }
+
+    fn sync_textures(
+        &mut self,
+        device: &ID3D11Device,
+        textures: &HashMap<GpuTextureHandle, GpuTextureDesc>,
+    ) -> Result<()> {
+        let stale_handles = self
+            .textures
+            .keys()
+            .copied()
+            .filter(|handle| !textures.contains_key(handle))
+            .collect::<Vec<_>>();
+        for handle in stale_handles {
+            if let Some(texture) = self.textures.remove(&handle) {
+                let key = DirectXGpuSurfaceTexturePoolKey::from(&texture.desc);
+                self.texture_pool.recycle(key, texture);
+            }
+        }
+
+        for (&handle, desc) in textures {
+            let needs_recreate = self
+                .textures
+                .get(&handle)
+                .is_none_or(|texture| texture.desc != *desc);
+            if needs_recreate {
+                if let Some(texture) = self.textures.remove(&handle) {
+                    let key = DirectXGpuSurfaceTexturePoolKey::from(&texture.desc);
+                    self.texture_pool.recycle(key, texture);
+                }
+                let mut texture = self
+                    .texture_pool
+                    .take(desc)
+                    .unwrap_or(create_gpu_surface_texture(device, desc)?);
+                texture.desc = desc.clone();
+                self.textures.insert(handle, texture);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sync_buffers(
+        &mut self,
+        device: &ID3D11Device,
+        buffers: &HashMap<GpuBufferHandle, GpuBufferDesc>,
+    ) -> Result<()> {
+        self.buffers
+            .retain(|handle, _| buffers.contains_key(handle));
+
+        for (&handle, desc) in buffers {
+            let needs_recreate = self
+                .buffers
+                .get(&handle)
+                .is_none_or(|buffer| buffer.desc != *desc);
+            if needs_recreate {
+                self.buffers
+                    .insert(handle, create_gpu_surface_buffer(device, desc)?);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sync_samplers(
+        &mut self,
+        device: &ID3D11Device,
+        samplers: &HashMap<GpuSamplerHandle, GpuSamplerDesc>,
+    ) -> Result<()> {
+        self.samplers
+            .retain(|handle, _| samplers.contains_key(handle));
+
+        for (&handle, desc) in samplers {
+            let needs_recreate = self
+                .samplers
+                .get(&handle)
+                .is_none_or(|sampler| sampler.desc != *desc);
+            if needs_recreate {
+                self.samplers
+                    .insert(handle, create_gpu_surface_sampler(device, desc)?);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sync_render_programs(
+        &mut self,
+        device: &ID3D11Device,
+        render_programs: &HashMap<GpuRenderProgramHandle, GpuRenderProgramDesc>,
+    ) -> Result<()> {
+        self.render_programs
+            .retain(|handle, _| render_programs.contains_key(handle));
+
+        for (&handle, desc) in render_programs {
+            let needs_recreate = self
+                .render_programs
+                .get(&handle)
+                .is_none_or(|program| program.desc != *desc);
+            if needs_recreate {
+                self.render_programs
+                    .insert(handle, create_gpu_surface_render_program(device, desc)?);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sync_compute_programs(
+        &mut self,
+        device: &ID3D11Device,
+        compute_programs: &HashMap<GpuComputeProgramHandle, GpuComputeProgramDesc>,
+    ) -> Result<()> {
+        self.compute_programs
+            .retain(|handle, _| compute_programs.contains_key(handle));
+
+        for (&handle, desc) in compute_programs {
+            let needs_recreate = self
+                .compute_programs
+                .get(&handle)
+                .is_none_or(|program| program.desc != *desc);
+            if needs_recreate {
+                self.compute_programs
+                    .insert(handle, create_gpu_surface_compute_program(device, desc)?);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn execute_graph(
+        &mut self,
+        device_context: &ID3D11DeviceContext,
+        frame: &GpuFrameContext,
+        scale_factor: f32,
+        graph: &GpuRecordedGraph,
+    ) -> Result<()> {
+        self.apply_buffer_writes(device_context, graph.buffer_writes())?;
+        for operation in &graph.operations {
+            match operation {
+                GpuGraphOperation::RenderPass(pass) => {
+                    self.execute_render_pass(device_context, frame, scale_factor, pass)?
+                }
+                GpuGraphOperation::ComputePass(pass) => {
+                    self.execute_compute_pass(device_context, frame, scale_factor, pass)?
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_buffer_writes(
+        &mut self,
+        device_context: &ID3D11DeviceContext,
+        writes: &[GpuBufferWrite],
+    ) -> Result<()> {
+        let mut dirty_buffers = Vec::new();
+        for write in writes {
+            let buffer = self
+                .buffers
+                .get_mut(&write.buffer)
+                .context("GpuSurface buffer write target missing in DX11 state")?;
+            let start = write.offset as usize;
+            let end = start + write.data.len();
+            if end > buffer.desc.size as usize {
+                anyhow::bail!(
+                    "GpuSurface buffer write exceeds buffer bounds on DX11 execution: offset {}, size {}, capacity {}",
+                    write.offset,
+                    write.data.len(),
+                    buffer.desc.size
+                );
+            }
+            buffer.data[start..end].copy_from_slice(&write.data);
+            if !dirty_buffers.contains(&write.buffer) {
+                dirty_buffers.push(write.buffer);
+            }
+        }
+
+        for handle in dirty_buffers {
+            let buffer = self
+                .buffers
+                .get(&handle)
+                .context("GpuSurface dirty buffer missing in DX11 state")?;
+            upload_gpu_surface_buffer(device_context, buffer)?;
+        }
+
+        Ok(())
+    }
+
+    fn execute_render_pass(
+        &mut self,
+        device_context: &ID3D11DeviceContext,
+        frame: &GpuFrameContext,
+        scale_factor: f32,
+        pass: &GpuRenderPassDesc,
+    ) -> Result<()> {
+        let target = self
+            .textures
+            .get(&pass.target)
+            .context("GpuSurface render pass target missing in DX11 state")?;
+        let program = self
+            .render_programs
+            .get(&pass.program)
+            .context("GpuSurface render program missing in DX11 state")?;
+
+        if let Some(clear_color) = pass.clear_color {
+            let render_target_view = target
+                .render_target_view
+                .as_ref()
+                .context("GpuSurface render target is not renderable on DX11")?;
+            unsafe {
+                device_context.ClearRenderTargetView(
+                    render_target_view,
+                    &[clear_color.r, clear_color.g, clear_color.b, clear_color.a],
+                );
+            }
+        }
+
+        if pass.bindings.len() != program.bindings.len() {
+            anyhow::bail!(
+                "GpuSurface render pass binding count mismatch: shader expects {}, graph provides {}",
+                program.bindings.len(),
+                pass.bindings.len()
+            );
+        }
+        let render_target_view = target
+            .render_target_view
+            .as_ref()
+            .context("GpuSurface render target is not renderable on DX11")?;
+        let frame_uniform = gpu_surface_frame_uniform(frame, scale_factor);
+        update_buffer(
+            device_context,
+            &self.frame_uniform_buffer,
+            std::slice::from_ref(&frame_uniform),
+        )?;
+
+        let viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: target.desc.extent.width.max(1) as f32,
+            Height: target.desc.extent.height.max(1) as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let scissor = RECT {
+            left: 0,
+            top: 0,
+            right: target.desc.extent.width.max(1) as i32,
+            bottom: target.desc.extent.height.max(1) as i32,
+        };
+        let render_target = [Some(render_target_view.clone())];
+        let frame_uniform_buffer = [Some(self.frame_uniform_buffer.clone())];
+        let mut extra_constant_buffers = Vec::new();
+        let mut extra_shader_resources = Vec::new();
+        let mut extra_samplers = Vec::new();
+        for (binding, layout) in pass.bindings.iter().zip(program.bindings.iter()) {
+            match (binding, layout.kind) {
+                (
+                    GpuBinding::UniformBuffer(handle),
+                    DirectXGpuSurfaceProgramBindingKind::UniformBuffer,
+                ) => {
+                    let buffer = self
+                        .buffers
+                        .get(handle)
+                        .context("GpuSurface uniform buffer binding missing in DX11 state")?;
+                    if buffer.desc.usage != GpuBufferUsage::Uniform {
+                        anyhow::bail!("GpuSurface uniform binding points to a non-uniform buffer");
+                    }
+                    extra_constant_buffers.push((layout.slot, buffer.buffer.clone()));
+                }
+                (
+                    GpuBinding::SampledTexture(handle),
+                    DirectXGpuSurfaceProgramBindingKind::SampledTexture,
+                ) => {
+                    let view = self
+                        .textures
+                        .get(handle)
+                        .context("GpuSurface sampled texture binding missing in DX11 state")?
+                        .shader_resource_view
+                        .clone()
+                        .context("GpuSurface sampled texture is not sampleable on DX11")?;
+                    extra_shader_resources.push((layout.slot, view));
+                }
+                (GpuBinding::Sampler(handle), DirectXGpuSurfaceProgramBindingKind::Sampler) => {
+                    let sampler = self
+                        .samplers
+                        .get(handle)
+                        .context("GpuSurface sampler binding missing in DX11 state")?
+                        .sampler
+                        .clone();
+                    extra_samplers.push((layout.slot, sampler));
+                }
+                (
+                    GpuBinding::StorageBuffer(_),
+                    DirectXGpuSurfaceProgramBindingKind::StorageBufferReadOnly,
+                )
+                | (
+                    GpuBinding::StorageBuffer(_),
+                    DirectXGpuSurfaceProgramBindingKind::StorageBufferReadWrite,
+                )
+                | (
+                    GpuBinding::StorageTexture(_),
+                    DirectXGpuSurfaceProgramBindingKind::StorageTexture,
+                ) => {
+                    anyhow::bail!("GpuSurface DX11 executor does not support storage bindings yet");
+                }
+                _ => {
+                    anyhow::bail!("GpuSurface render pass binding type does not match shader");
+                }
+            }
+        }
+        let vertex_count = match pass.draw {
+            GpuDrawCall::FullScreenTriangle => 3,
+            GpuDrawCall::Triangles { .. } => {
+                anyhow::bail!(
+                    "GpuSurface DX11 executor supports only FullScreenTriangle draws for now"
+                );
+            }
+        };
+        unsafe {
+            device_context.OMSetRenderTargets(Some(&render_target), None);
+            device_context.RSSetViewports(Some(std::slice::from_ref(&viewport)));
+            device_context.RSSetScissorRects(Some(std::slice::from_ref(&scissor)));
+            device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            device_context.VSSetShader(&program.vertex, None);
+            device_context.PSSetShader(&program.fragment, None);
+            device_context.VSSetConstantBuffers(0, Some(&frame_uniform_buffer));
+            device_context.PSSetConstantBuffers(0, Some(&frame_uniform_buffer));
+            for (slot, buffer) in &extra_constant_buffers {
+                let constant_buffer = [Some(buffer.clone())];
+                device_context.VSSetConstantBuffers(*slot, Some(&constant_buffer));
+                device_context.PSSetConstantBuffers(*slot, Some(&constant_buffer));
+            }
+            for (slot, view) in &extra_shader_resources {
+                let shader_resource = [Some(view.clone())];
+                device_context.VSSetShaderResources(*slot, Some(&shader_resource));
+                device_context.PSSetShaderResources(*slot, Some(&shader_resource));
+            }
+            for (slot, sampler) in &extra_samplers {
+                let sampler_state = [Some(sampler.clone())];
+                device_context.VSSetSamplers(*slot, Some(&sampler_state));
+                device_context.PSSetSamplers(*slot, Some(&sampler_state));
+            }
+            device_context.Draw(vertex_count, 0);
+
+            let empty_constant_buffer: [Option<ID3D11Buffer>; 1] = [None];
+            let empty_shader_resource: [Option<ID3D11ShaderResourceView>; 1] = [None];
+            let empty_sampler: [Option<ID3D11SamplerState>; 1] = [None];
+            for (slot, _) in &extra_constant_buffers {
+                device_context.VSSetConstantBuffers(*slot, Some(&empty_constant_buffer));
+                device_context.PSSetConstantBuffers(*slot, Some(&empty_constant_buffer));
+            }
+            for (slot, _) in &extra_shader_resources {
+                device_context.VSSetShaderResources(*slot, Some(&empty_shader_resource));
+                device_context.PSSetShaderResources(*slot, Some(&empty_shader_resource));
+            }
+            for (slot, _) in &extra_samplers {
+                device_context.VSSetSamplers(*slot, Some(&empty_sampler));
+                device_context.PSSetSamplers(*slot, Some(&empty_sampler));
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_compute_pass(
+        &mut self,
+        device_context: &ID3D11DeviceContext,
+        frame: &GpuFrameContext,
+        scale_factor: f32,
+        pass: &GpuComputePassDesc,
+    ) -> Result<()> {
+        if pass.workgroups.contains(&0) {
+            return Ok(());
+        }
+
+        let program = self
+            .compute_programs
+            .get(&pass.program)
+            .context("GpuSurface compute program missing in DX11 state")?;
+
+        if pass.bindings.len() != program.bindings.len() {
+            anyhow::bail!(
+                "GpuSurface compute pass binding count mismatch: shader expects {}, graph provides {}",
+                program.bindings.len(),
+                pass.bindings.len()
+            );
+        }
+
+        let frame_uniform = gpu_surface_frame_uniform(frame, scale_factor);
+        update_buffer(
+            device_context,
+            &self.frame_uniform_buffer,
+            std::slice::from_ref(&frame_uniform),
+        )?;
+
+        let frame_uniform_buffer = [Some(self.frame_uniform_buffer.clone())];
+        let mut extra_constant_buffers = Vec::new();
+        let mut extra_shader_resources = Vec::new();
+        let mut extra_unordered_access_views = Vec::new();
+        let mut extra_samplers = Vec::new();
+        for (binding, layout) in pass.bindings.iter().zip(program.bindings.iter()) {
+            match (binding, layout.kind) {
+                (
+                    GpuBinding::UniformBuffer(handle),
+                    DirectXGpuSurfaceProgramBindingKind::UniformBuffer,
+                ) => {
+                    let buffer = self
+                        .buffers
+                        .get(handle)
+                        .context("GpuSurface uniform buffer binding missing in DX11 state")?;
+                    if buffer.desc.usage != GpuBufferUsage::Uniform {
+                        anyhow::bail!("GpuSurface uniform binding points to a non-uniform buffer");
+                    }
+                    extra_constant_buffers.push((layout.slot, buffer.buffer.clone()));
+                }
+                (
+                    GpuBinding::StorageBuffer(handle),
+                    DirectXGpuSurfaceProgramBindingKind::StorageBufferReadOnly,
+                ) => {
+                    let buffer = self
+                        .buffers
+                        .get(handle)
+                        .context("GpuSurface storage buffer binding missing in DX11 state")?;
+                    if buffer.desc.usage != GpuBufferUsage::Storage {
+                        anyhow::bail!("GpuSurface storage binding points to a non-storage buffer");
+                    }
+                    let view = buffer
+                        .shader_resource_view
+                        .clone()
+                        .context("GpuSurface storage buffer is not readable on DX11")?;
+                    extra_shader_resources.push((layout.slot, view));
+                }
+                (
+                    GpuBinding::StorageBuffer(handle),
+                    DirectXGpuSurfaceProgramBindingKind::StorageBufferReadWrite,
+                ) => {
+                    let buffer = self
+                        .buffers
+                        .get(handle)
+                        .context("GpuSurface storage buffer binding missing in DX11 state")?;
+                    if buffer.desc.usage != GpuBufferUsage::Storage {
+                        anyhow::bail!("GpuSurface storage binding points to a non-storage buffer");
+                    }
+                    let view = buffer
+                        .unordered_access_view
+                        .clone()
+                        .context("GpuSurface storage buffer is not writable on DX11")?;
+                    extra_unordered_access_views.push((layout.slot, view));
+                }
+                (
+                    GpuBinding::SampledTexture(handle),
+                    DirectXGpuSurfaceProgramBindingKind::SampledTexture,
+                ) => {
+                    let view = self
+                        .textures
+                        .get(handle)
+                        .context("GpuSurface sampled texture binding missing in DX11 state")?
+                        .shader_resource_view
+                        .clone()
+                        .context("GpuSurface sampled texture is not sampleable on DX11")?;
+                    extra_shader_resources.push((layout.slot, view));
+                }
+                (
+                    GpuBinding::StorageTexture(handle),
+                    DirectXGpuSurfaceProgramBindingKind::StorageTexture,
+                ) => {
+                    let view = self
+                        .textures
+                        .get(handle)
+                        .context("GpuSurface storage texture binding missing in DX11 state")?
+                        .unordered_access_view
+                        .clone()
+                        .context("GpuSurface storage texture is not writable on DX11")?;
+                    extra_unordered_access_views.push((layout.slot, view));
+                }
+                (GpuBinding::Sampler(handle), DirectXGpuSurfaceProgramBindingKind::Sampler) => {
+                    let sampler = self
+                        .samplers
+                        .get(handle)
+                        .context("GpuSurface sampler binding missing in DX11 state")?
+                        .sampler
+                        .clone();
+                    extra_samplers.push((layout.slot, sampler));
+                }
+                _ => {
+                    anyhow::bail!("GpuSurface compute pass binding type does not match shader");
+                }
+            }
+        }
+
+        unsafe {
+            device_context.CSSetShader(&program.compute, None);
+            device_context.CSSetConstantBuffers(0, Some(&frame_uniform_buffer));
+            for (slot, buffer) in &extra_constant_buffers {
+                let constant_buffer = [Some(buffer.clone())];
+                device_context.CSSetConstantBuffers(*slot, Some(&constant_buffer));
+            }
+            for (slot, view) in &extra_shader_resources {
+                let shader_resource = [Some(view.clone())];
+                device_context.CSSetShaderResources(*slot, Some(&shader_resource));
+            }
+            for (slot, sampler) in &extra_samplers {
+                let sampler_state = [Some(sampler.clone())];
+                device_context.CSSetSamplers(*slot, Some(&sampler_state));
+            }
+            for (slot, view) in &extra_unordered_access_views {
+                let unordered_access_view = [Some(view.clone())];
+                device_context.CSSetUnorderedAccessViews(
+                    *slot,
+                    1,
+                    Some(unordered_access_view.as_ptr()),
+                    None,
+                );
+            }
+            device_context.Dispatch(pass.workgroups[0], pass.workgroups[1], pass.workgroups[2]);
+
+            let empty_constant_buffer: [Option<ID3D11Buffer>; 1] = [None];
+            let empty_shader_resource: [Option<ID3D11ShaderResourceView>; 1] = [None];
+            let empty_sampler: [Option<ID3D11SamplerState>; 1] = [None];
+            let empty_unordered_access_view: [Option<ID3D11UnorderedAccessView>; 1] = [None];
+            for (slot, _) in &extra_constant_buffers {
+                device_context.CSSetConstantBuffers(*slot, Some(&empty_constant_buffer));
+            }
+            for (slot, _) in &extra_shader_resources {
+                device_context.CSSetShaderResources(*slot, Some(&empty_shader_resource));
+            }
+            for (slot, _) in &extra_samplers {
+                device_context.CSSetSamplers(*slot, Some(&empty_sampler));
+            }
+            for (slot, _) in &extra_unordered_access_views {
+                device_context.CSSetUnorderedAccessViews(
+                    *slot,
+                    1,
+                    Some(empty_unordered_access_view.as_ptr()),
+                    None,
+                );
+            }
+            device_context.CSSetShader(Option::<&ID3D11ComputeShader>::None, None);
+        }
+
+        Ok(())
+    }
+
+    fn presented_view(&self, handle: GpuTextureHandle) -> Result<ID3D11ShaderResourceView> {
+        self.textures
+            .get(&handle)
+            .context("GpuSurface present texture missing in DX11 state")?
+            .shader_resource_view
+            .clone()
+            .context("GpuSurface present texture is not sampleable on DX11")
+    }
 }
 
 impl DirectXRendererDevices {
@@ -196,6 +899,8 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            gpu_surfaces: HashMap::default(),
+            frame_serial: 0,
         })
     }
 
@@ -283,6 +988,7 @@ impl DirectXRenderer {
 
             self.direct_composition.take();
             self.devices.take();
+            self.gpu_surfaces.clear();
         }
 
         let devices = DirectXRendererDevices::new(directx_devices, disable_direct_composition)
@@ -331,9 +1037,11 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
+        self.frame_serial += 1;
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
+            self.prune_stale_gpu_surfaces();
             return Ok(());
         }
         let clear_color = match background_appearance {
@@ -398,7 +1106,9 @@ impl DirectXRenderer {
         if use_backdrop {
             self.blit_backdrop_to_frame()?;
         }
-        self.present()
+        let result = self.present();
+        self.prune_stale_gpu_surfaces();
+        result
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -705,9 +1415,7 @@ impl DirectXRenderer {
             };
 
             let kernel = (radius * 1.5).ceil();
-            let expanded = filter
-                .bounds
-                .dilate(ScaledPixels::from(kernel + 2.0));
+            let expanded = filter.bounds.dilate(ScaledPixels::from(kernel + 2.0));
             let expanded_scaled = if scale == 1 {
                 expanded
             } else {
@@ -725,7 +1433,8 @@ impl DirectXRenderer {
                 _ => full_height.div_ceil(4),
             };
 
-            let scissor_expanded = scissor_from_bounds(expanded_scaled, target_width, target_height);
+            let scissor_expanded =
+                scissor_from_bounds(expanded_scaled, target_width, target_height);
             let scissor_full = scissor_from_bounds(filter.bounds, full_width, full_height);
 
             let passes = blur_passes(radius, scale);
@@ -832,14 +1541,16 @@ impl DirectXRenderer {
                     device_context,
                     &[instance],
                 )?;
-                self.pipelines.backdrop_blur_blit_pipeline.draw_with_texture(
-                    device_context,
-                    slice::from_ref(&Some(main_srv.clone())),
-                    slice::from_ref(&down_viewport),
-                    slice::from_ref(&self.globals.global_params_buffer),
-                    slice::from_ref(&self.globals.sampler),
-                    1,
-                )?;
+                self.pipelines
+                    .backdrop_blur_blit_pipeline
+                    .draw_with_texture(
+                        device_context,
+                        slice::from_ref(&Some(main_srv.clone())),
+                        slice::from_ref(&down_viewport),
+                        slice::from_ref(&self.globals.global_params_buffer),
+                        slice::from_ref(&self.globals.sampler),
+                        1,
+                    )?;
             }
 
             let mut source_srv = down_srv.unwrap_or(main_srv);
@@ -1046,14 +1757,16 @@ impl DirectXRenderer {
             &devices.device_context,
             &[instance],
         )?;
-        self.pipelines.backdrop_blur_blit_pipeline.draw_with_texture(
-            &devices.device_context,
-            slice::from_ref(&Some(main_srv.clone())),
-            slice::from_ref(&resources.viewport),
-            slice::from_ref(&self.globals.global_params_buffer),
-            slice::from_ref(&self.globals.sampler),
-            1,
-        )
+        self.pipelines
+            .backdrop_blur_blit_pipeline
+            .draw_with_texture(
+                &devices.device_context,
+                slice::from_ref(&Some(main_srv.clone())),
+                slice::from_ref(&resources.viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.sampler),
+                1,
+            )
     }
 
     fn draw_underlines(&mut self, start: usize, len: usize) -> Result<()> {
@@ -1149,7 +1862,78 @@ impl DirectXRenderer {
         if surfaces.is_empty() {
             return Ok(());
         }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let sprites = surfaces
+            .iter()
+            .map(|surface| SurfaceSprite {
+                bounds: surface.bounds,
+                content_mask: surface.content_mask.bounds,
+                corner_radii: surface.corner_radii,
+            })
+            .collect::<Vec<_>>();
+        self.pipelines.surface_pipeline.update_buffer(
+            &devices.device,
+            &devices.device_context,
+            &sprites,
+        )?;
+
+        for (index, surface) in surfaces.iter().enumerate() {
+            let texture_view: ID3D11ShaderResourceView = surface
+                .texture_view
+                .cast()
+                .context("Casting GpuSurface texture view to DX11 SRV")?;
+            self.pipelines.surface_pipeline.draw_range_with_texture(
+                &devices.device,
+                &devices.device_context,
+                &[Some(texture_view)],
+                slice::from_ref(&resources.viewport),
+                slice::from_ref(&self.globals.global_params_buffer),
+                slice::from_ref(&self.globals.surface_sampler),
+                index as u32,
+                1,
+            )?;
+        }
+
         Ok(())
+    }
+
+    pub(crate) fn paint_gpu_surface(
+        &mut self,
+        input: GpuSurfaceExecutionInput<'_>,
+    ) -> Result<Option<PaintSurface>> {
+        let Some(presented) = input.graph.presented else {
+            return Ok(None);
+        };
+        let frame = input
+            .frame
+            .context("GpuSurface DX11 executor requires a prepared frame context")?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let state = self
+            .gpu_surfaces
+            .entry(input.surface_id)
+            .or_insert(DirectXGpuSurfaceState::new(&devices.device)?);
+        state.last_used_frame = self.frame_serial + 1;
+        state.sync_textures(&devices.device, input.textures)?;
+        state.sync_buffers(&devices.device, input.buffers)?;
+        state.sync_samplers(&devices.device, input.samplers)?;
+        state.sync_render_programs(&devices.device, input.render_programs)?;
+        state.sync_compute_programs(&devices.device, input.compute_programs)?;
+        state.execute_graph(
+            &devices.device_context,
+            frame,
+            input.scale_factor,
+            input.graph,
+        )?;
+        let texture_view = state.presented_view(presented)?;
+
+        Ok(Some(PaintSurface {
+            order: 0,
+            bounds: input.bounds,
+            content_mask: input.content_mask,
+            corner_radii: input.corner_radii,
+            texture_view: texture_view.cast()?,
+        }))
     }
 
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
@@ -1198,6 +1982,12 @@ impl DirectXRenderer {
 
     pub(crate) fn mark_drawable(&mut self) {
         self.skip_draws = false;
+    }
+
+    fn prune_stale_gpu_surfaces(&mut self) {
+        let frame_serial = self.frame_serial;
+        self.gpu_surfaces
+            .retain(|_, state| state.last_used_frame >= frame_serial);
     }
 }
 
@@ -1423,6 +2213,13 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        let surface_pipeline = PipelineState::new(
+            device,
+            "surface_pipeline",
+            ShaderModule::Surface,
+            16,
+            create_blend_state(device)?,
+        )?;
 
         Ok(Self {
             shadow_pipeline,
@@ -1436,6 +2233,7 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            surface_pipeline,
         })
     }
 }
@@ -1496,9 +2294,28 @@ impl DirectXGlobalElements {
             output
         };
 
+        let surface_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            output
+        };
+
         Ok(Self {
             global_params_buffer,
             sampler,
+            surface_sampler,
         })
     }
 }
@@ -1723,6 +2540,14 @@ struct PathSprite {
     bounds: Bounds<ScaledPixels>,
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SurfaceSprite {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: Bounds<ScaledPixels>,
+    corner_radii: Corners<ScaledPixels>,
+}
+
 impl Drop for DirectXRenderer {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
@@ -1943,6 +2768,679 @@ fn create_backdrop_texture(
     Ok((texture, rtv, srv))
 }
 
+fn create_gpu_surface_texture(
+    device: &ID3D11Device,
+    desc: &GpuTextureDesc,
+) -> Result<DirectXGpuSurfaceTexture> {
+    let bind_flags = if desc.sampled {
+        D3D11_BIND_SHADER_RESOURCE.0 as u32
+    } else {
+        0
+    } | if desc.render_attachment {
+        D3D11_BIND_RENDER_TARGET.0 as u32
+    } else {
+        0
+    } | if desc.storage {
+        D3D11_BIND_UNORDERED_ACCESS.0 as u32
+    } else {
+        0
+    };
+    let texture = unsafe {
+        let mut output = None;
+        let texture_desc = D3D11_TEXTURE2D_DESC {
+            Width: desc.extent.width.max(1),
+            Height: desc.extent.height.max(1),
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: gpu_texture_format_to_dxgi(desc.format),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: bind_flags,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        device.CreateTexture2D(&texture_desc, None, Some(&mut output))?;
+        output.unwrap()
+    };
+
+    let mut shader_resource_view = None;
+    if desc.sampled {
+        unsafe {
+            device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))?;
+        }
+    }
+
+    let mut render_target_view = None;
+    if desc.render_attachment {
+        unsafe {
+            device.CreateRenderTargetView(&texture, None, Some(&mut render_target_view))?;
+        }
+    }
+
+    let mut unordered_access_view = None;
+    if desc.storage {
+        unsafe {
+            device.CreateUnorderedAccessView(&texture, None, Some(&mut unordered_access_view))?;
+        }
+    }
+
+    Ok(DirectXGpuSurfaceTexture {
+        desc: desc.clone(),
+        _texture: texture,
+        render_target_view,
+        shader_resource_view,
+        unordered_access_view,
+    })
+}
+
+fn create_gpu_surface_buffer(
+    device: &ID3D11Device,
+    desc: &GpuBufferDesc,
+) -> Result<DirectXGpuSurfaceBuffer> {
+    let (buffer, shader_resource_view, unordered_access_view) = match desc.usage {
+        GpuBufferUsage::Uniform => (
+            create_constant_buffer(device, desc.size as usize)?,
+            None,
+            None,
+        ),
+        GpuBufferUsage::Storage => {
+            let buffer_desc = D3D11_BUFFER_DESC {
+                ByteWidth: gpu_surface_buffer_byte_width(desc),
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32
+                    | D3D11_BIND_UNORDERED_ACCESS.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS.0 as u32,
+                StructureByteStride: 0,
+            };
+            let mut output = None;
+            unsafe { device.CreateBuffer(&buffer_desc, None, Some(&mut output))? };
+            let buffer = output.unwrap();
+            let shader_resource_view = Some(
+                create_gpu_surface_storage_buffer_shader_resource_view(device, &buffer, desc)?,
+            );
+            let unordered_access_view = Some(
+                create_gpu_surface_storage_buffer_unordered_access_view(device, &buffer, desc)?,
+            );
+            (buffer, shader_resource_view, unordered_access_view)
+        }
+    };
+
+    Ok(DirectXGpuSurfaceBuffer {
+        desc: desc.clone(),
+        buffer,
+        data: vec![0; gpu_surface_buffer_byte_width(desc) as usize],
+        shader_resource_view,
+        unordered_access_view,
+    })
+}
+
+fn create_gpu_surface_sampler(
+    device: &ID3D11Device,
+    desc: &GpuSamplerDesc,
+) -> Result<DirectXGpuSurfaceSampler> {
+    let state = unsafe {
+        let sampler_desc = D3D11_SAMPLER_DESC {
+            Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+            AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+            AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+            MipLODBias: 0.0,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+            BorderColor: [0.0; 4],
+            MinLOD: 0.0,
+            MaxLOD: D3D11_FLOAT32_MAX,
+        };
+        let mut output = None;
+        device.CreateSamplerState(&sampler_desc, Some(&mut output))?;
+        output.unwrap()
+    };
+
+    Ok(DirectXGpuSurfaceSampler {
+        desc: desc.clone(),
+        sampler: state,
+    })
+}
+
+fn gpu_surface_buffer_byte_width(desc: &GpuBufferDesc) -> u32 {
+    match desc.usage {
+        GpuBufferUsage::Uniform => ((desc.size as u32).max(1)).div_ceil(16) * 16,
+        GpuBufferUsage::Storage => ((desc.size as u32).max(4)).div_ceil(4) * 4,
+    }
+}
+
+fn upload_gpu_surface_buffer(
+    device_context: &ID3D11DeviceContext,
+    buffer: &DirectXGpuSurfaceBuffer,
+) -> Result<()> {
+    match buffer.desc.usage {
+        GpuBufferUsage::Uniform => {
+            update_buffer(device_context, &buffer.buffer, buffer.data.as_slice())
+        }
+        GpuBufferUsage::Storage => {
+            unsafe {
+                device_context.UpdateSubresource(
+                    &buffer.buffer,
+                    0,
+                    None,
+                    buffer.data.as_ptr() as _,
+                    0,
+                    0,
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn create_gpu_surface_storage_buffer_shader_resource_view(
+    device: &ID3D11Device,
+    buffer: &ID3D11Buffer,
+    desc: &GpuBufferDesc,
+) -> Result<ID3D11ShaderResourceView> {
+    let byte_width = gpu_surface_buffer_byte_width(desc);
+    let view_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D_SRV_DIMENSION_BUFFEREX,
+        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+            BufferEx: D3D11_BUFFEREX_SRV {
+                FirstElement: 0,
+                NumElements: byte_width / 4,
+                Flags: D3D11_BUFFEREX_SRV_FLAG_RAW.0 as u32,
+            },
+        },
+    };
+    let mut view = None;
+    unsafe { device.CreateShaderResourceView(buffer, Some(&view_desc), Some(&mut view))? };
+    Ok(view.expect("DX11 storage buffer SRV creation should populate the view"))
+}
+
+fn create_gpu_surface_storage_buffer_unordered_access_view(
+    device: &ID3D11Device,
+    buffer: &ID3D11Buffer,
+    desc: &GpuBufferDesc,
+) -> Result<ID3D11UnorderedAccessView> {
+    let byte_width = gpu_surface_buffer_byte_width(desc);
+    let view_desc = D3D11_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D11_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D11_BUFFER_UAV {
+                FirstElement: 0,
+                NumElements: byte_width / 4,
+                Flags: D3D11_BUFFER_UAV_FLAG_RAW.0 as u32,
+            },
+        },
+    };
+    let mut view = None;
+    unsafe { device.CreateUnorderedAccessView(buffer, Some(&view_desc), Some(&mut view))? };
+    Ok(view.expect("DX11 storage buffer UAV creation should populate the view"))
+}
+
+fn create_gpu_surface_render_program(
+    device: &ID3D11Device,
+    desc: &GpuRenderProgramDesc,
+) -> Result<DirectXGpuSurfaceRenderProgram> {
+    let module =
+        naga::front::wgsl::parse_str(desc.wgsl.as_ref()).context("Parsing GpuSurface WGSL")?;
+    let bindings = gpu_surface_program_bindings(&module)?;
+    let mut validator = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    );
+    validator.subgroup_stages(naga::valid::ShaderStages::all());
+    validator.subgroup_operations(naga::valid::SubgroupOperationSet::all());
+    let module_info = validator
+        .validate(&module)
+        .context("Validating GpuSurface WGSL module")?;
+    let sampler_bindings = gpu_surface_hlsl_sampler_bindings(&module)?;
+    let vertex_hlsl = build_gpu_surface_hlsl_source(
+        &module,
+        &module_info,
+        naga::ShaderStage::Vertex,
+        desc.vertex_entry.as_ref(),
+        desc.fragment_entry.as_ref(),
+        &sampler_bindings,
+    )?;
+    let fragment_hlsl = build_gpu_surface_hlsl_source(
+        &module,
+        &module_info,
+        naga::ShaderStage::Fragment,
+        desc.fragment_entry.as_ref(),
+        desc.fragment_entry.as_ref(),
+        &sampler_bindings,
+    )?;
+    let vertex_blob = compile_hlsl_blob(
+        &vertex_hlsl,
+        desc.vertex_entry.as_ref(),
+        "vs_5_0",
+        desc.label.as_ref().map(|label| label.as_ref()),
+    )?;
+    let fragment_blob = compile_hlsl_blob(
+        &fragment_hlsl,
+        desc.fragment_entry.as_ref(),
+        "ps_5_0",
+        desc.label.as_ref().map(|label| label.as_ref()),
+    )?;
+    let vertex = create_vertex_shader(device, blob_bytes(&vertex_blob))?;
+    let fragment = create_fragment_shader(device, blob_bytes(&fragment_blob))?;
+
+    Ok(DirectXGpuSurfaceRenderProgram {
+        desc: desc.clone(),
+        vertex,
+        fragment,
+        bindings,
+    })
+}
+
+fn create_gpu_surface_compute_program(
+    device: &ID3D11Device,
+    desc: &GpuComputeProgramDesc,
+) -> Result<DirectXGpuSurfaceComputeProgram> {
+    let module =
+        naga::front::wgsl::parse_str(desc.wgsl.as_ref()).context("Parsing GpuSurface WGSL")?;
+    let bindings = gpu_surface_program_bindings(&module)?;
+    let mut validator = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    );
+    validator.subgroup_stages(naga::valid::ShaderStages::all());
+    validator.subgroup_operations(naga::valid::SubgroupOperationSet::all());
+    let module_info = validator
+        .validate(&module)
+        .context("Validating GpuSurface WGSL module")?;
+    let sampler_bindings = gpu_surface_hlsl_sampler_bindings(&module)?;
+    let compute_hlsl = build_gpu_surface_hlsl_source(
+        &module,
+        &module_info,
+        naga::ShaderStage::Compute,
+        desc.entry.as_ref(),
+        desc.entry.as_ref(),
+        &sampler_bindings,
+    )?;
+    let compute_blob = compile_hlsl_blob(
+        &compute_hlsl,
+        desc.entry.as_ref(),
+        "cs_5_0",
+        desc.label.as_ref().map(|label| label.as_ref()),
+    )?;
+    let compute = create_compute_shader(device, blob_bytes(&compute_blob))?;
+
+    Ok(DirectXGpuSurfaceComputeProgram {
+        desc: desc.clone(),
+        compute,
+        bindings,
+    })
+}
+
+fn gpu_surface_program_bindings(
+    module: &naga::Module,
+) -> Result<Vec<DirectXGpuSurfaceProgramBinding>> {
+    let mut bindings = Vec::new();
+    for (_, variable) in module.global_variables.iter() {
+        let Some(binding) = variable.binding else {
+            continue;
+        };
+        if binding.group != 0 {
+            anyhow::bail!("GpuSurface DX11 supports only @group(0) bindings");
+        }
+        let kind = gpu_surface_binding_kind(module, variable)
+            .with_context(|| format!("Failed to resolve WGSL binding {}", binding.binding))?;
+        if binding.binding == 0 {
+            if kind != DirectXGpuSurfaceProgramBindingKind::UniformBuffer {
+                anyhow::bail!(
+                    "GpuSurface DX11 reserves @group(0) @binding(0) for the frame uniform buffer"
+                );
+            }
+            continue;
+        }
+        bindings.push(DirectXGpuSurfaceProgramBinding {
+            slot: binding.binding,
+            kind,
+        });
+    }
+    bindings.sort_by_key(|binding| binding.slot);
+    Ok(bindings)
+}
+
+fn gpu_surface_binding_kind(
+    module: &naga::Module,
+    variable: &naga::GlobalVariable,
+) -> Result<DirectXGpuSurfaceProgramBindingKind> {
+    use naga::{AddressSpace, StorageAccess, TypeInner};
+
+    let inner = &module.types[variable.ty].inner;
+    if let TypeInner::BindingArray { .. } = inner {
+        anyhow::bail!("GpuSurface DX11 does not support binding arrays yet");
+    }
+    if matches!(inner, TypeInner::Sampler { .. }) {
+        return Ok(DirectXGpuSurfaceProgramBindingKind::Sampler);
+    }
+    if let TypeInner::Image { class, .. } = inner {
+        return Ok(match class {
+            naga::ImageClass::Sampled { .. } | naga::ImageClass::Depth { .. } => {
+                DirectXGpuSurfaceProgramBindingKind::SampledTexture
+            }
+            naga::ImageClass::Storage { .. } => DirectXGpuSurfaceProgramBindingKind::StorageTexture,
+            naga::ImageClass::External => {
+                anyhow::bail!("GpuSurface DX11 does not support external image bindings")
+            }
+        });
+    }
+
+    match variable.space {
+        AddressSpace::Uniform => Ok(DirectXGpuSurfaceProgramBindingKind::UniformBuffer),
+        AddressSpace::Storage { access } => {
+            if access.contains(StorageAccess::STORE) {
+                Ok(DirectXGpuSurfaceProgramBindingKind::StorageBufferReadWrite)
+            } else {
+                Ok(DirectXGpuSurfaceProgramBindingKind::StorageBufferReadOnly)
+            }
+        }
+        _ => anyhow::bail!(
+            "GpuSurface DX11 does not support bindings from address space {:?}",
+            variable.space
+        ),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GpuSurfaceHlslSamplerBinding {
+    name: String,
+    group: u32,
+    slot: u32,
+    comparison: bool,
+}
+
+fn gpu_surface_hlsl_sampler_bindings(
+    module: &naga::Module,
+) -> Result<Vec<GpuSurfaceHlslSamplerBinding>> {
+    let mut sampler_bindings = Vec::new();
+    for (_, variable) in module.global_variables.iter() {
+        let Some(binding) = variable.binding else {
+            continue;
+        };
+        if binding.group != 0 {
+            anyhow::bail!("GpuSurface DX11 supports only @group(0) bindings");
+        }
+        let naga::TypeInner::Sampler { comparison } = module.types[variable.ty].inner else {
+            continue;
+        };
+        let name = variable
+            .name
+            .clone()
+            .context("GpuSurface DX11 requires named WGSL sampler bindings")?;
+        sampler_bindings.push(GpuSurfaceHlslSamplerBinding {
+            name,
+            group: binding.group,
+            slot: binding.binding,
+            comparison,
+        });
+    }
+    Ok(sampler_bindings)
+}
+
+fn build_gpu_surface_hlsl_source(
+    module: &naga::Module,
+    module_info: &naga::valid::ModuleInfo,
+    stage: naga::ShaderStage,
+    entry_point: &str,
+    fragment_entry_point: &str,
+    sampler_bindings: &[GpuSurfaceHlslSamplerBinding],
+) -> Result<String> {
+    let mut binding_map = naga::back::hlsl::BindingMap::default();
+    let mut sampler_groups = BTreeSet::new();
+    for (_, variable) in module.global_variables.iter() {
+        let Some(binding) = variable.binding else {
+            continue;
+        };
+        if binding.group != 0 {
+            anyhow::bail!("GpuSurface DX11 supports only @group(0) bindings");
+        }
+        if matches!(
+            module.types[variable.ty].inner,
+            naga::TypeInner::Sampler { .. }
+        ) {
+            sampler_groups.insert(binding.group);
+        }
+        binding_map.insert(
+            binding,
+            naga::back::hlsl::BindTarget {
+                space: 0,
+                register: binding.binding,
+                binding_array_size: None,
+                dynamic_storage_buffer_offsets_index: None,
+                restrict_indexing: false,
+            },
+        );
+    }
+    let mut sampler_buffer_binding_map = naga::back::hlsl::SamplerIndexBufferBindingMap::default();
+    let mut next_sampler_buffer_register = binding_map
+        .values()
+        .map(|target| target.register)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    for group in sampler_groups {
+        sampler_buffer_binding_map.insert(
+            naga::back::hlsl::SamplerIndexBufferKey { group },
+            naga::back::hlsl::BindTarget {
+                space: 0,
+                register: next_sampler_buffer_register,
+                binding_array_size: None,
+                dynamic_storage_buffer_offsets_index: None,
+                restrict_indexing: false,
+            },
+        );
+        next_sampler_buffer_register += 1;
+    }
+    let options = naga::back::hlsl::Options {
+        shader_model: naga::back::hlsl::ShaderModel::V5_0,
+        binding_map,
+        sampler_buffer_binding_map,
+        fake_missing_bindings: false,
+        ..Default::default()
+    };
+    let pipeline_options = naga::back::hlsl::PipelineOptions {
+        entry_point: Some((stage, entry_point.to_string())),
+    };
+    let vertex_fragment_entry =
+        naga::back::hlsl::FragmentEntryPoint::new(module, fragment_entry_point);
+    let mut output = String::new();
+    naga::back::hlsl::Writer::new(&mut output, &options, &pipeline_options)
+        .write(
+            module,
+            module_info,
+            if stage == naga::ShaderStage::Vertex {
+                vertex_fragment_entry.as_ref()
+            } else {
+                None
+            },
+        )
+        .context("Generating HLSL for GpuSurface render program")?;
+    strip_gpu_surface_hlsl_register_spaces(rewrite_gpu_surface_hlsl_sampler_bindings(
+        output,
+        sampler_bindings,
+    )?)
+}
+
+fn rewrite_gpu_surface_hlsl_sampler_bindings(
+    source: String,
+    sampler_bindings: &[GpuSurfaceHlslSamplerBinding],
+) -> Result<String> {
+    if sampler_bindings.is_empty() {
+        return Ok(source);
+    }
+
+    let mut rewritten = Vec::new();
+    let mut replaced_samplers = 0usize;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("SamplerState nagaSamplerHeap[2048]: register(")
+            || trimmed
+                .starts_with("SamplerComparisonState nagaComparisonSamplerHeap[2048]: register(")
+            || (trimmed.starts_with("StructuredBuffer<uint> nagaGroup")
+                && trimmed.contains("SamplerIndexArray : register("))
+        {
+            continue;
+        }
+
+        let mut replaced = false;
+        for binding in sampler_bindings {
+            let sampler_type = if binding.comparison {
+                "SamplerComparisonState"
+            } else {
+                "SamplerState"
+            };
+            let heap_var = if binding.comparison {
+                "nagaComparisonSamplerHeap"
+            } else {
+                "nagaSamplerHeap"
+            };
+            let expected = format!(
+                "static const {sampler_type} {} = {heap_var}[nagaGroup{}SamplerIndexArray[{}]];",
+                binding.name, binding.group, binding.slot
+            );
+            if trimmed == expected {
+                rewritten.push(format!(
+                    "{sampler_type} {} : register(s{});",
+                    binding.name, binding.slot
+                ));
+                replaced_samplers += 1;
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            rewritten.push(line.to_string());
+        }
+    }
+
+    if replaced_samplers != sampler_bindings.len() {
+        anyhow::bail!("Failed to rewrite all GpuSurface sampler bindings for DX11 HLSL generation");
+    }
+
+    Ok(rewritten.join("\n"))
+}
+
+fn strip_gpu_surface_hlsl_register_spaces(source: String) -> Result<String> {
+    if source.contains("space1") {
+        anyhow::bail!(
+            "GpuSurface DX11 HLSL generation left an unsupported non-zero register space"
+        );
+    }
+    Ok(source.replace(", space0)", ")"))
+}
+
+fn compile_hlsl_blob(
+    source: &str,
+    entry_point: &str,
+    target: &str,
+    source_name: Option<&str>,
+) -> Result<windows::Win32::Graphics::Direct3D::ID3DBlob> {
+    let source_name = source_name.map(std::ffi::CString::new).transpose()?;
+    let entry_point = std::ffi::CString::new(entry_point)?;
+    let target = std::ffi::CString::new(target)?;
+    let mut shader_blob = None;
+    let mut error_blob = None;
+    let result = unsafe {
+        windows::Win32::Graphics::Direct3D::Fxc::D3DCompile(
+            source.as_ptr() as *const _,
+            source.len(),
+            source_name
+                .as_ref()
+                .map(|name| PCSTR::from_raw(name.as_ptr() as *const u8))
+                .unwrap_or(PCSTR::null()),
+            None,
+            None,
+            PCSTR::from_raw(entry_point.as_ptr() as *const u8),
+            PCSTR::from_raw(target.as_ptr() as *const u8),
+            windows::Win32::Graphics::Direct3D::Fxc::D3DCOMPILE_ENABLE_STRICTNESS,
+            0,
+            &mut shader_blob,
+            Some(&mut error_blob),
+        )
+    };
+    if let Err(error) = result {
+        if let Some(error_blob) = error_blob {
+            let error_string =
+                unsafe { std::ffi::CStr::from_ptr(error_blob.GetBufferPointer() as *const i8) }
+                    .to_string_lossy()
+                    .into_owned();
+            anyhow::bail!("Compiling GpuSurface HLSL failed: {error_string}");
+        }
+        return Err(error).context("Compiling GpuSurface HLSL failed");
+    }
+
+    Ok(shader_blob.expect("D3DCompile should populate the shader blob"))
+}
+
+fn blob_bytes(blob: &windows::Win32::Graphics::Direct3D::ID3DBlob) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())
+    }
+}
+
+fn create_constant_buffer(device: &ID3D11Device, size: usize) -> Result<ID3D11Buffer> {
+    let byte_width = size.div_ceil(16) * 16;
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: byte_width as u32,
+        Usage: D3D11_USAGE_DYNAMIC,
+        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+        ..Default::default()
+    };
+    let mut buffer = None;
+    unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer))? };
+    Ok(buffer.unwrap())
+}
+
+fn gpu_surface_frame_uniform(frame: &GpuFrameContext, scale_factor: f32) -> GpuSurfaceFrameUniform {
+    let surface_cursor_position = frame
+        .surface_cursor_position
+        .unwrap_or(point(px(0.0), px(0.0)))
+        .scale(scale_factor);
+    let cursor_position = frame.cursor_position.scale(scale_factor);
+    GpuSurfaceFrameUniform {
+        metrics: [
+            frame.time.as_secs_f32(),
+            frame.delta_time.as_secs_f32(),
+            frame.frame_index as f32,
+            if frame.surface_cursor_position.is_some() {
+                1.0
+            } else {
+                0.0
+            },
+        ],
+        extent_cursor: [
+            frame.extent.width as f32,
+            frame.extent.height as f32,
+            cursor_position.x.as_f32(),
+            cursor_position.y.as_f32(),
+        ],
+        surface_cursor: [
+            surface_cursor_position.x.as_f32(),
+            surface_cursor_position.y.as_f32(),
+            0.0,
+            0.0,
+        ],
+    }
+}
+
+fn gpu_texture_format_to_dxgi(format: GpuTextureFormat) -> DXGI_FORMAT {
+    match format {
+        GpuTextureFormat::Rgba8Unorm => DXGI_FORMAT_R8G8B8A8_UNORM,
+        GpuTextureFormat::Bgra8Unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
+        GpuTextureFormat::Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        GpuTextureFormat::R32Float => DXGI_FORMAT_R32_FLOAT,
+        GpuTextureFormat::Rgba32Float => DXGI_FORMAT_R32G32B32A32_FLOAT,
+    }
+}
+
 #[inline]
 fn set_viewport(device_context: &ID3D11DeviceContext, width: f32, height: f32) -> D3D11_VIEWPORT {
     let viewport = [D3D11_VIEWPORT {
@@ -2161,6 +3659,15 @@ fn create_fragment_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11P
 }
 
 #[inline]
+fn create_compute_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11ComputeShader> {
+    unsafe {
+        let mut shader = None;
+        device.CreateComputeShader(bytes, None, Some(&mut shader))?;
+        Ok(shader.unwrap())
+    }
+}
+
+#[inline]
 fn create_buffer(
     device: &ID3D11Device,
     element_size: usize,
@@ -2230,6 +3737,218 @@ fn update_buffer<T>(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        DirectXGpuSurfaceProgramBinding, DirectXGpuSurfaceProgramBindingKind,
+        DirectXGpuSurfaceTexturePool, GpuSurfaceHlslSamplerBinding,
+        rewrite_gpu_surface_hlsl_sampler_bindings,
+    };
+    use nekowg::{GpuExtent, GpuTextureDesc, GpuTextureFormat};
+
+    #[test]
+    fn gpu_surface_texture_pool_reuses_matching_desc_ignoring_labels() {
+        let mut pool = DirectXGpuSurfaceTexturePool::default();
+        let desc = GpuTextureDesc {
+            label: Some("first".into()),
+            extent: GpuExtent {
+                width: 96,
+                height: 64,
+            },
+            format: GpuTextureFormat::Rgba8Unorm,
+            sampled: true,
+            storage: true,
+            render_attachment: false,
+            copy_src: false,
+            copy_dst: false,
+        };
+        let same_texture_different_label = GpuTextureDesc {
+            label: Some("second".into()),
+            ..desc.clone()
+        };
+
+        pool.recycle((&desc).into(), 7u32);
+
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.take(&same_texture_different_label), Some(7));
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn gpu_surface_texture_pool_keeps_distinct_descs_separate() {
+        let mut pool = DirectXGpuSurfaceTexturePool::default();
+        let base = GpuTextureDesc {
+            extent: GpuExtent {
+                width: 64,
+                height: 64,
+            },
+            format: GpuTextureFormat::Rgba8Unorm,
+            sampled: true,
+            storage: true,
+            render_attachment: false,
+            copy_src: false,
+            copy_dst: false,
+            ..GpuTextureDesc::default()
+        };
+        let different_extent = GpuTextureDesc {
+            extent: GpuExtent {
+                width: 128,
+                height: 64,
+            },
+            ..base.clone()
+        };
+
+        pool.recycle((&base).into(), 11u32);
+
+        assert_eq!(pool.take(&different_extent), None);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.take(&base), Some(11));
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn rewrites_sampler_heap_bindings_into_direct_sampler_registers() {
+        let source = r#"
+SamplerState nagaSamplerHeap[2048]: register(s0, space0);
+SamplerComparisonState nagaComparisonSamplerHeap[2048]: register(s0, space1);
+StructuredBuffer<uint> nagaGroup0SamplerIndexArray : register(t3, space0);
+Texture2D<float4> source_tex : register(t1, space0);
+static const SamplerState source_sampler = nagaSamplerHeap[nagaGroup0SamplerIndexArray[2]];
+"#
+        .trim()
+        .to_string();
+
+        let rewritten = rewrite_gpu_surface_hlsl_sampler_bindings(
+            source,
+            &[GpuSurfaceHlslSamplerBinding {
+                name: "source_sampler".into(),
+                group: 0,
+                slot: 2,
+                comparison: false,
+            }],
+        )
+        .expect("sampler rewrite should succeed");
+
+        let rewritten = super::strip_gpu_surface_hlsl_register_spaces(rewritten)
+            .expect("space stripping should work");
+
+        assert!(rewritten.contains("Texture2D<float4> source_tex : register(t1);"));
+        assert!(rewritten.contains("SamplerState source_sampler : register(s2);"));
+        assert!(!rewritten.contains("nagaSamplerHeap"));
+        assert!(!rewritten.contains("nagaGroup0SamplerIndexArray"));
+    }
+
+    #[test]
+    fn generated_gpu_surface_hlsl_strips_register_spaces_for_shader_model_5_0() {
+        let wgsl = r#"
+struct GpuSurfaceFrame {
+    metrics: vec4<f32>,
+    extent_cursor: vec4<f32>,
+    surface_cursor: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> frame: GpuSurfaceFrame;
+
+@group(0) @binding(1)
+var source_tex: texture_2d<f32>;
+
+@group(0) @binding(2)
+var source_sampler: sampler;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(3.0, 1.0),
+        vec2<f32>(-1.0, 1.0),
+    );
+    var uvs = array<vec2<f32>, 3>(
+        vec2<f32>(0.0, 2.0),
+        vec2<f32>(2.0, 0.0),
+        vec2<f32>(0.0, 0.0),
+    );
+    let position = positions[vertex_index];
+    return VertexOutput(vec4<f32>(position, 0.0, 1.0), uvs[vertex_index]);
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(source_tex, source_sampler, input.uv);
+}
+"#;
+        let module = naga::front::wgsl::parse_str(wgsl).expect("WGSL should parse");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator.subgroup_stages(naga::valid::ShaderStages::all());
+        validator.subgroup_operations(naga::valid::SubgroupOperationSet::all());
+        let module_info = validator.validate(&module).expect("WGSL should validate");
+        let sampler_bindings = super::gpu_surface_hlsl_sampler_bindings(&module)
+            .expect("sampler bindings should resolve");
+        let source = super::build_gpu_surface_hlsl_source(
+            &module,
+            &module_info,
+            naga::ShaderStage::Fragment,
+            "fs_main",
+            "fs_main",
+            &sampler_bindings,
+        )
+        .expect("HLSL generation should succeed");
+
+        assert!(
+            !source.contains("space"),
+            "generated HLSL still contains register spaces:\n{source}"
+        );
+    }
+
+    #[test]
+    fn storage_buffer_bindings_track_access_mode() {
+        let wgsl = r#"
+struct GpuSurfaceFrame {
+    metrics: vec4<f32>,
+    extent_cursor: vec4<f32>,
+    surface_cursor: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> frame: GpuSurfaceFrame;
+
+@group(0) @binding(1)
+var<storage, read> input_data: array<u32>;
+
+@group(0) @binding(2)
+var<storage, read_write> output_data: array<u32>;
+
+@compute @workgroup_size(1, 1, 1)
+fn cs_main() {}
+"#;
+        let module = naga::front::wgsl::parse_str(wgsl).expect("WGSL should parse");
+        let bindings =
+            super::gpu_surface_program_bindings(&module).expect("bindings should resolve");
+
+        assert_eq!(
+            bindings,
+            vec![
+                DirectXGpuSurfaceProgramBinding {
+                    slot: 1,
+                    kind: DirectXGpuSurfaceProgramBindingKind::StorageBufferReadOnly,
+                },
+                DirectXGpuSurfaceProgramBinding {
+                    slot: 2,
+                    kind: DirectXGpuSurfaceProgramBindingKind::StorageBufferReadWrite,
+                },
+            ]
+        );
+    }
+}
+
 #[inline]
 fn set_pipeline_state(
     device_context: &ID3D11DeviceContext,
@@ -2290,6 +4009,7 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        Surface,
         EmojiRasterization,
     }
 
@@ -2375,6 +4095,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::Surface => match target {
+                    ShaderTarget::Vertex => SURFACE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => SURFACE_FRAGMENT_BYTES,
                 },
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
@@ -2469,6 +4193,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::Surface => "surface",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }

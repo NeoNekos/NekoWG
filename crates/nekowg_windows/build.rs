@@ -37,6 +37,7 @@ mod shader_compilation {
             "backdrop_blur_blit",
             "path_rasterization",
             "path_sprite",
+            "surface",
             "underline",
             "monochrome_sprite",
             "subpixel_sprite",

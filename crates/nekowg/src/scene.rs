@@ -142,8 +142,7 @@ impl Scene {
 
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
-        self.backdrop_filters
-            .sort_by_key(|filter| filter.order);
+        self.backdrop_filters.sort_by_key(|filter| filter.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
@@ -360,9 +359,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     filters_end += 1;
                 }
                 self.backdrop_filters_start = filters_end;
-                Some(PrimitiveBatch::BackdropFilters(
-                    filters_start..filters_end,
-                ))
+                Some(PrimitiveBatch::BackdropFilters(filters_start..filters_end))
             }
             PrimitiveKind::Quad => {
                 let quads_start = self.quads_start;
@@ -773,8 +770,11 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    #[cfg(target_os = "windows")]
+    pub texture_view: windows::core::IUnknown,
 }
 
 impl From<PaintSurface> for Primitive {
