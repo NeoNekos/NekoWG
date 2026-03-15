@@ -45,7 +45,6 @@ nekowg_platform = { package = "nekowg_platform", path = "crates/nekowg_platform"
 nekowg_web = { package = "nekowg_web", path = "crates/nekowg_web" }
 nekowg_wgpu = { package = "nekowg_wgpu", path = "crates/nekowg_wgpu" }
 nekowg_windows = { package = "nekowg_windows", path = "crates/nekowg_windows", default-features = false }
-nekowg_tokio = { path = "crates/nekowg_tokio" }
 nekowg_util = { package = "nekowg_util", path = "crates/nekowg_util" }
 http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }

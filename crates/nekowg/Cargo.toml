@@ -24,6 +24,9 @@ test-support = [
     "wayland",
     "x11",
     "proptest",
+    "futures-concurrency",
+    "postage",
+    "pollster",
 ]
 inspector = ["nekowg_macros/inspector"]
 leak-detection = ["backtrace"]
@@ -53,6 +56,7 @@ ctor.workspace = true
 derive_more.workspace = true
 etagere = "0.2"
 futures.workspace = true
+futures-concurrency = { version = "7.7.1", optional = true }
 nekowg_macros.workspace = true
 http_client.workspace = true
 image.workspace = true
@@ -62,6 +66,7 @@ log.workspace = true
 num_cpus = "1.13"
 parking = "2.0.0"
 parking_lot.workspace = true
+pollster = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
 chrono.workspace = true
 profiling.workspace = true
@@ -93,6 +98,7 @@ lyon = "1.0"
 pin-project = "1.1.10"
 circular-buffer.workspace = true
 spin = "0.10.0"
+postage = { version = "0.5", features = ["futures-traits"], optional = true }
 url.workspace = true
 uuid.workspace = true
 web-time.workspace = true

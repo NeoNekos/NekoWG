@@ -238,7 +238,11 @@ pub fn test(args: TokenStream, function: TokenStream) -> TokenStream {
 /// strategy, you can use `#[strategy = ...]` on the argument:
 /// ```
 /// #[nekowg::property_test]
-/// fn int_test(#[strategy = 1..10] x: i32, #[strategy = "[a-zA-Z0-9]{20}"] s: String) {
+/// fn int_test(
+///     #[strategy = "1..10"] x: i32,
+///     #[strategy = "nekowg::proptest::string::string_regex(\"[a-zA-Z0-9]{20}\").unwrap()"]
+///     s: String,
+/// ) {
 ///   assert!(s.len() > (x as usize));
 /// }
 /// ```

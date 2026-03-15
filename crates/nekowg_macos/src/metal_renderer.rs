@@ -751,15 +751,19 @@ impl MetalRenderer {
             return Ok(command_buffer.to_owned());
         }
 
-        let main_texture = if use_backdrop {
+        let main_texture_owned = if use_backdrop {
             Some(
                 self.backdrop_main_texture
                     .as_ref()
-                    .expect("backdrop main texture missing"),
+                    .expect("backdrop main texture missing")
+                    .to_owned(),
             )
         } else {
             None
         };
+        let main_texture = main_texture_owned
+            .as_ref()
+            .map(|texture| texture.as_ref());
 
         let clear_color = metal::MTLClearColor::new(0.0, 0.0, 0.0, alpha as f64);
 
@@ -1611,8 +1615,9 @@ impl MetalRenderer {
                 step / target_size_f[1].max(1.0),
             ];
 
-            let (down_texture, temp_texture) = match scale {
-                1 => (None, temp_full),
+            let (down_texture, temp_texture): (Option<&metal::TextureRef>, &metal::TextureRef) =
+                match scale {
+                    1 => (None, temp_full),
                 2 => (
                     Some(
                         self.backdrop_down2_texture
@@ -1795,7 +1800,7 @@ impl MetalRenderer {
             );
         }
 
-        let mut command_encoder = new_texture_command_encoder(
+        let command_encoder = new_texture_command_encoder(
             command_buffer,
             target_texture,
             viewport_size,
@@ -1871,7 +1876,7 @@ impl MetalRenderer {
         }
 
         let alpha = if self.layer.is_opaque() { 1.0 } else { 0.0 };
-        let mut command_encoder = new_command_encoder(
+        let command_encoder = new_command_encoder(
             command_buffer,
             drawable,
             viewport_size,
@@ -2024,7 +2029,7 @@ fn new_texture_command_encoder<'a>(
     color_attachment.set_texture(Some(texture));
     color_attachment.set_store_action(metal::MTLStoreAction::Store);
     color_attachment.set_load_action(load_action);
-    if load_action == metal::MTLLoadAction::Clear {
+    if matches!(load_action, metal::MTLLoadAction::Clear) {
         color_attachment.set_clear_color(clear_color);
     }
 

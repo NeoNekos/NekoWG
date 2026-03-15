@@ -901,27 +901,37 @@ struct BackdropBlurFragmentInput {
   uint blur_id [[flat]];
 };
 
-vertex BackdropBlurVertexOutput backdrop_blur_vertex(
-    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
-    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
-    constant BackdropBlurInstance *backdrop_blurs
-    [[buffer(BackdropBlurInputIndex_BackdropBlurs)]]) {
+BackdropBlurVertexOutput backdrop_blur_vertex_impl(
+    uint unit_vertex_id, uint blur_id, constant float2 *unit_vertices,
+    constant BackdropBlurInstance *backdrop_blurs) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   BackdropBlurInstance blur = backdrop_blurs[blur_id];
+  float2 viewport_size = float2(blur.viewport_size[0], blur.viewport_size[1]);
   float2 position =
       unit_vertex * float2(blur.bounds.size.width, blur.bounds.size.height) +
       float2(blur.bounds.origin.x, blur.bounds.origin.y);
 
   BackdropBlurVertexOutput output;
   output.position = to_device_position_with_viewport(unit_vertex, blur.bounds,
-                                                     blur.viewport_size);
-  output.uv = position / blur.viewport_size;
+                                                     viewport_size);
+  output.uv = position / viewport_size;
   output.blur_id = blur_id;
   float4 clip_distance =
       distance_from_clip_rect(unit_vertex, blur.bounds, blur.content_mask);
-  output.clip_distance = {clip_distance.x, clip_distance.y, clip_distance.z,
-                          clip_distance.w};
+  output.clip_distance[0] = clip_distance.x;
+  output.clip_distance[1] = clip_distance.y;
+  output.clip_distance[2] = clip_distance.z;
+  output.clip_distance[3] = clip_distance.w;
   return output;
+}
+
+vertex BackdropBlurVertexOutput backdrop_blur_vertex(
+    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlurInstance *backdrop_blurs
+    [[buffer(BackdropBlurInputIndex_BackdropBlurs)]]) {
+  return backdrop_blur_vertex_impl(unit_vertex_id, blur_id, unit_vertices,
+                                   backdrop_blurs);
 }
 
 vertex BackdropBlurVertexOutput backdrop_blur_h_vertex(
@@ -929,8 +939,8 @@ vertex BackdropBlurVertexOutput backdrop_blur_h_vertex(
     constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
     constant BackdropBlurInstance *backdrop_blurs
     [[buffer(BackdropBlurInputIndex_BackdropBlurs)]]) {
-  return backdrop_blur_vertex(unit_vertex_id, blur_id, unit_vertices,
-                              backdrop_blurs);
+  return backdrop_blur_vertex_impl(unit_vertex_id, blur_id, unit_vertices,
+                                   backdrop_blurs);
 }
 
 vertex BackdropBlurVertexOutput backdrop_blur_composite_vertex(
@@ -938,8 +948,8 @@ vertex BackdropBlurVertexOutput backdrop_blur_composite_vertex(
     constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
     constant BackdropBlurInstance *backdrop_blurs
     [[buffer(BackdropBlurInputIndex_BackdropBlurs)]]) {
-  return backdrop_blur_vertex(unit_vertex_id, blur_id, unit_vertices,
-                              backdrop_blurs);
+  return backdrop_blur_vertex_impl(unit_vertex_id, blur_id, unit_vertices,
+                                   backdrop_blurs);
 }
 
 vertex BackdropBlurVertexOutput backdrop_blur_blit_vertex(
@@ -947,8 +957,8 @@ vertex BackdropBlurVertexOutput backdrop_blur_blit_vertex(
     constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
     constant BackdropBlurInstance *backdrop_blurs
     [[buffer(BackdropBlurInputIndex_BackdropBlurs)]]) {
-  return backdrop_blur_vertex(unit_vertex_id, blur_id, unit_vertices,
-                              backdrop_blurs);
+  return backdrop_blur_vertex_impl(unit_vertex_id, blur_id, unit_vertices,
+                                   backdrop_blurs);
 }
 
 float4 gaussian_sample_sum(texture2d<float> input_texture, float2 uv,
@@ -974,8 +984,14 @@ fragment float4 backdrop_blur_h_fragment(
     texture2d<float> input_texture
     [[texture(BackdropBlurInputIndex_SourceTexture)]]) {
   BackdropBlurInstance blur = backdrop_blurs[input.blur_id];
-  return gaussian_sample_sum(input_texture, input.uv, blur.direction,
-                             blur.texel_step, blur.weights0, blur.weights1);
+  float2 direction = float2(blur.direction[0], blur.direction[1]);
+  float2 texel_step = float2(blur.texel_step[0], blur.texel_step[1]);
+  float4 weights0 =
+      float4(blur.weights0[0], blur.weights0[1], blur.weights0[2], blur.weights0[3]);
+  float4 weights1 =
+      float4(blur.weights1[0], blur.weights1[1], blur.weights1[2], blur.weights1[3]);
+  return gaussian_sample_sum(input_texture, input.uv, direction, texel_step,
+                             weights0, weights1);
 }
 
 fragment float4 backdrop_blur_composite_fragment(
@@ -985,9 +1001,14 @@ fragment float4 backdrop_blur_composite_fragment(
     texture2d<float> input_texture
     [[texture(BackdropBlurInputIndex_SourceTexture)]]) {
   BackdropBlurInstance blur = backdrop_blurs[input.blur_id];
-  float4 blurred = gaussian_sample_sum(input_texture, input.uv, blur.direction,
-                                       blur.texel_step, blur.weights0,
-                                       blur.weights1);
+  float2 direction = float2(blur.direction[0], blur.direction[1]);
+  float2 texel_step = float2(blur.texel_step[0], blur.texel_step[1]);
+  float4 weights0 =
+      float4(blur.weights0[0], blur.weights0[1], blur.weights0[2], blur.weights0[3]);
+  float4 weights1 =
+      float4(blur.weights1[0], blur.weights1[1], blur.weights1[2], blur.weights1[3]);
+  float4 blurred = gaussian_sample_sum(input_texture, input.uv, direction,
+                                       texel_step, weights0, weights1);
   float saturation = max(0.0f, blur.saturation);
   float luma = dot(blurred.rgb, float3(0.2126f, 0.7152f, 0.0722f));
   float3 saturated = mix(float3(luma), blurred.rgb, saturation);

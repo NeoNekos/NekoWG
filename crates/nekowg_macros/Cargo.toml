@@ -24,4 +24,4 @@ quote.workspace = true
 syn.workspace = true
 
 [dev-dependencies]
-nekowg = { workspace = true, features = ["inspector"] }
+nekowg = { workspace = true, features = ["inspector", "test-support"] }

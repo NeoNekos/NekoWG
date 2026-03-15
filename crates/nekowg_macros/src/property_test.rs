@@ -32,7 +32,7 @@ pub fn test(args: TokenStream, item: TokenStream) -> TokenStream {
     let cx_teardowns = parsed_args.cx_teardowns;
 
     let proptest_args = quote! {
-        #[strategy = ::nekowg::seed_strategy()] __seed: u64,
+        #[strategy = "::nekowg::seed_strategy()"] __seed: u64,
         #proptest_args
     };
 
