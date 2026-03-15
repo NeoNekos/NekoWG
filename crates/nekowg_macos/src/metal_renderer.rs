@@ -2876,9 +2876,6 @@ fn create_gpu_surface_compute_program(
         .new_compute_pipeline_state_with_function(&function)
         .map_err(anyhow::Error::msg)
         .context("Creating GpuSurface Metal compute pipeline")?;
-    if let Some(label) = desc.label.as_ref() {
-        pipeline.set_label(label.as_ref());
-    }
 
     Ok(MetalGpuSurfaceComputeProgram {
         desc: desc.clone(),
