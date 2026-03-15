@@ -837,12 +837,14 @@ fragment float4 path_sprite_fragment(
 }
 
 struct SurfaceVertexOutput {
+  uint surface_id [[flat]];
   float4 position [[position]];
   float2 texture_position;
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
+  uint surface_id [[flat]];
   float4 position [[position]];
   float2 texture_position;
 };
@@ -865,16 +867,20 @@ vertex SurfaceVertexOutput surface_vertex(
   // to the current vertex of the unit triangle.
   float2 texture_position = unit_vertex;
   return SurfaceVertexOutput{
+      surface_id,
       device_position,
       texture_position,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
+                                 constant SurfaceBounds *surfaces
+                                 [[buffer(SurfaceInputIndex_Surfaces)]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
                                  [[texture(SurfaceInputIndex_CbCrTexture)]]) {
+  SurfaceBounds surface = surfaces[input.surface_id];
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
   const float4x4 ycbcrToRGBTransform =
       float4x4(float4(+1.0000f, +1.0000f, +1.0000f, +0.0000f),
@@ -884,15 +890,22 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   float4 ycbcr = float4(
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
-
-  return ycbcrToRGBTransform * ycbcr;
+  float4 color = ycbcrToRGBTransform * ycbcr;
+  color.a *= saturate(0.5 - quad_sdf(input.position.xy, surface.bounds,
+                                     surface.corner_radii));
+  return color;
 }
 
 fragment float4 surface_rgb_fragment(
     SurfaceFragmentInput input [[stage_in]],
+    constant SurfaceBounds *surfaces [[buffer(SurfaceInputIndex_Surfaces)]],
     texture2d<float> color_texture [[texture(SurfaceInputIndex_YTexture)]]) {
+  SurfaceBounds surface = surfaces[input.surface_id];
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
-  return color_texture.sample(texture_sampler, input.texture_position);
+  float4 color = color_texture.sample(texture_sampler, input.texture_position);
+  color.a *= saturate(0.5 - quad_sdf(input.position.xy, surface.bounds,
+                                     surface.corner_radii));
+  return color;
 }
 
 struct BackdropBlurVertexOutput {

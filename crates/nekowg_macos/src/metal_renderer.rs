@@ -2120,12 +2120,17 @@ impl MetalRenderer {
 
         for surface in surfaces {
             align_offset(instance_offset);
-            let next_offset = *instance_offset + mem::size_of::<Surface>();
+            let next_offset = *instance_offset + mem::size_of::<SurfaceBounds>();
             if next_offset > instance_buffer.size {
                 return false;
             }
 
             command_encoder.set_vertex_buffer(
+                SurfaceInputIndex::Surfaces as u64,
+                Some(&instance_buffer.metal_buffer),
+                *instance_offset as u64,
+            );
+            command_encoder.set_fragment_buffer(
                 SurfaceInputIndex::Surfaces as u64,
                 Some(&instance_buffer.metal_buffer),
                 *instance_offset as u64,
@@ -2140,6 +2145,7 @@ impl MetalRenderer {
                     SurfaceBounds {
                         bounds: surface.bounds,
                         content_mask: surface.content_mask.clone(),
+                        corner_radii: surface.corner_radii,
                     },
                 );
             }
@@ -3374,4 +3380,5 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
 }

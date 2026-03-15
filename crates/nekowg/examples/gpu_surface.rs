@@ -328,7 +328,7 @@ fn main() {
 #[cfg(all(target_os = "macos", feature = "test-support"))]
 mod visual_smoke {
     use super::*;
-    use anyhow::{Context, Result, bail};
+    use anyhow::{Result, bail};
     use image::RgbaImage;
     use nekowg::{Modifiers, VisualTestAppContext, point};
     use nekowg_platform::current_platform;
