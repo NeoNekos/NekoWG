@@ -522,12 +522,9 @@ impl MetalRenderer {
 
         let width = size.width.0 as u64;
         let height = size.height.0 as u64;
-        let needs_recreate = self
-            .backdrop_main_texture
-            .as_ref()
-            .map_or(true, |texture| {
-                texture.width() != width || texture.height() != height
-            });
+        let needs_recreate = self.backdrop_main_texture.as_ref().map_or(true, |texture| {
+            texture.width() != width || texture.height() != height
+        });
 
         if !needs_recreate {
             return true;
@@ -542,18 +539,12 @@ impl MetalRenderer {
             height: DevicePixels(((size.height.0 + 3) / 4).max(1)),
         };
 
-        self.backdrop_main_texture =
-            Some(self.create_backdrop_texture(size, "backdrop_main"));
-        self.backdrop_temp_texture =
-            Some(self.create_backdrop_texture(size, "backdrop_temp"));
-        self.backdrop_down2_texture =
-            Some(self.create_backdrop_texture(down2, "backdrop_down2"));
-        self.backdrop_temp2_texture =
-            Some(self.create_backdrop_texture(down2, "backdrop_temp2"));
-        self.backdrop_down4_texture =
-            Some(self.create_backdrop_texture(down4, "backdrop_down4"));
-        self.backdrop_temp4_texture =
-            Some(self.create_backdrop_texture(down4, "backdrop_temp4"));
+        self.backdrop_main_texture = Some(self.create_backdrop_texture(size, "backdrop_main"));
+        self.backdrop_temp_texture = Some(self.create_backdrop_texture(size, "backdrop_temp"));
+        self.backdrop_down2_texture = Some(self.create_backdrop_texture(down2, "backdrop_down2"));
+        self.backdrop_temp2_texture = Some(self.create_backdrop_texture(down2, "backdrop_temp2"));
+        self.backdrop_down4_texture = Some(self.create_backdrop_texture(down4, "backdrop_down4"));
+        self.backdrop_temp4_texture = Some(self.create_backdrop_texture(down4, "backdrop_temp4"));
 
         true
     }
@@ -1588,8 +1579,7 @@ impl MetalRenderer {
             };
 
             let kernel = (radius * 1.5).ceil();
-            let expanded_bounds =
-                filter.bounds.dilate(ScaledPixels::from(kernel + 2.0));
+            let expanded_bounds = filter.bounds.dilate(ScaledPixels::from(kernel + 2.0));
             let expanded_scaled = if scale == 1 {
                 expanded_bounds
             } else {
@@ -1736,8 +1726,7 @@ impl MetalRenderer {
                         return false;
                     }
                 } else {
-                    let down_texture =
-                        down_texture.expect("downsample texture missing");
+                    let down_texture = down_texture.expect("downsample texture missing");
                     let blur_instance = BackdropBlurInstance::blur_instance(
                         expanded_scaled,
                         expanded_scaled,
@@ -1832,12 +1821,7 @@ impl MetalRenderer {
         if let Some(scissor) = scissor {
             command_encoder.set_scissor_rect(scissor);
         }
-        command_encoder.draw_primitives_instanced(
-            metal::MTLPrimitiveType::Triangle,
-            0,
-            6,
-            1,
-        );
+        command_encoder.draw_primitives_instanced(metal::MTLPrimitiveType::Triangle, 0, 6, 1);
         command_encoder.end_encoding();
 
         *instance_offset = next_offset;
@@ -1912,12 +1896,7 @@ impl MetalRenderer {
             BackdropBlurInputIndex::SourceTexture as u64,
             Some(main_texture),
         );
-        command_encoder.draw_primitives_instanced(
-            metal::MTLPrimitiveType::Triangle,
-            0,
-            6,
-            1,
-        );
+        command_encoder.draw_primitives_instanced(metal::MTLPrimitiveType::Triangle, 0, 6, 1);
         command_encoder.end_encoding();
         *instance_offset = next_offset;
         Ok(())

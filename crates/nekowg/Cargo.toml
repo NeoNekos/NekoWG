@@ -129,22 +129,23 @@ pathfinder_geometry = "0.5"
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))'.dependencies]
 scap = { workspace = true, optional = true }
 
-
-
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation"] }
-
 
 [dev-dependencies]
 backtrace.workspace = true
 collections = { workspace = true, features = ["test-support"] }
 env_logger.workspace = true
+futures-concurrency = "7.7.1"
 nekowg_platform.workspace = true
 lyon = { version = "1.0", features = ["extra"] }
+pollster.workspace = true
+postage = { version = "0.5", features = ["futures-traits"] }
 pretty_assertions.workspace = true
 rand.workspace = true
 scheduler = { workspace = true, features = ["test-support"] }
 unicode-segmentation.workspace = true
+util_macros.workspace = true
 nekowg_util = { workspace = true }
 proptest = { workspace = true }
 
@@ -164,9 +165,6 @@ bindgen = "0.71"
 cbindgen = { version = "0.28.0", default-features = false }
 naga.workspace = true
 
-
-
-
 [[example]]
 name = "hello_world"
 path = "examples/hello_world.rs"
@@ -174,6 +172,10 @@ path = "examples/hello_world.rs"
 [[example]]
 name = "image"
 path = "examples/image/image.rs"
+
+[[example]]
+name = "gpu_surface"
+path = "examples/gpu_surface.rs"
 
 [[example]]
 name = "input"

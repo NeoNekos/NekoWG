@@ -841,7 +841,9 @@ impl PlatformWindow for WindowsWindow {
             if IsIconic(self.0.hwnd).as_bool() {
                 ShowWindowAsync(self.0.hwnd, SW_RESTORE).ok().log_err();
             } else {
-                ShowWindowAsync(self.0.hwnd, SW_SHOWNOACTIVATE).ok().log_err();
+                ShowWindowAsync(self.0.hwnd, SW_SHOWNOACTIVATE)
+                    .ok()
+                    .log_err();
             }
         }
     }
@@ -936,6 +938,15 @@ impl PlatformWindow for WindowsWindow {
             .borrow_mut()
             .draw(scene, self.state.background_appearance.get())
             .log_err();
+    }
+
+    fn paint_gpu_surface(&self, input: GpuSurfaceExecutionInput<'_>) -> Option<PaintSurface> {
+        self.state
+            .renderer
+            .borrow_mut()
+            .paint_gpu_surface(input)
+            .log_err()
+            .flatten()
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

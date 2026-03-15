@@ -115,7 +115,11 @@ impl RenderImage {
     ) -> Self {
         let mut render_frames = SmallVec::<[RenderFrame; 1]>::new();
         for (index, (size, delay)) in frames.iter().enumerate() {
-            let pixels = if index == 0 { first_pixels.clone() } else { None };
+            let pixels = if index == 0 {
+                first_pixels.clone()
+            } else {
+                None
+            };
             render_frames.push(RenderFrame::new(*size, *delay, pixels));
         }
         Self::from_render_frames(render_frames)
@@ -252,7 +256,11 @@ impl fmt::Debug for RenderImage {
 
 impl RenderFrame {
     pub(crate) fn new(size: Size<DevicePixels>, delay: Delay, pixels: Option<Arc<[u8]>>) -> Self {
-        Self { size, delay, pixels }
+        Self {
+            size,
+            delay,
+            pixels,
+        }
     }
 
     fn from_frame(frame: Frame) -> Self {
@@ -278,7 +286,11 @@ struct FrameCache {
 
 impl FrameCache {
     fn get(&mut self, frame_index: usize) -> Option<Arc<[u8]>> {
-        if let Some(pos) = self.frames.iter().position(|entry| entry.index == frame_index) {
+        if let Some(pos) = self
+            .frames
+            .iter()
+            .position(|entry| entry.index == frame_index)
+        {
             if let Some(entry) = self.frames.remove(pos) {
                 let pixels = entry.pixels.clone();
                 self.frames.push_back(entry);
@@ -289,10 +301,17 @@ impl FrameCache {
     }
 
     fn insert(&mut self, frame_index: usize, pixels: Arc<[u8]>) {
-        if let Some(pos) = self.frames.iter().position(|entry| entry.index == frame_index) {
+        if let Some(pos) = self
+            .frames
+            .iter()
+            .position(|entry| entry.index == frame_index)
+        {
             self.frames.remove(pos);
         }
-        self.frames.push_back(CachedFrame { index: frame_index, pixels });
+        self.frames.push_back(CachedFrame {
+            index: frame_index,
+            pixels,
+        });
         while self.frames.len() > ANIMATED_FRAME_CACHE_FRAMES {
             self.frames.pop_front();
         }

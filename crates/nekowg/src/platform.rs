@@ -31,10 +31,11 @@ pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBu
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
-    ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
-    Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderImageSource,
-    RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
-    SystemWindowTab, Task, ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
+    ForegroundExecutor, GlyphId, GpuSpecs, GpuSurfaceExecutionInput, ImageSource, Keymap,
+    LineLayout, PaintSurface, Pixels, PlatformInput, Point, Priority, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderImageSource, RenderSvgParams, Scene, ShapedGlyph,
+    ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, ThreadTaskTimings, Window,
+    WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
@@ -540,6 +541,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
+    #[doc(hidden)]
+    fn paint_gpu_surface(&self, _input: GpuSurfaceExecutionInput<'_>) -> Option<PaintSurface> {
+        None
+    }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 

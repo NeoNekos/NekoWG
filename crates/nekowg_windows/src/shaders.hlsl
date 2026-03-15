@@ -1116,6 +1116,55 @@ float4 path_sprite_fragment(PathSpriteVertexOutput input): SV_Target {
 
 /*
 **
+**              Surface sprites
+**
+*/
+
+struct SurfaceSprite {
+    Bounds bounds;
+    Bounds content_mask;
+    Corners corner_radii;
+};
+
+struct SurfaceSpriteVertexOutput {
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_coords: TEXCOORD1;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct SurfaceSpriteFragmentInput {
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_coords: TEXCOORD1;
+};
+
+StructuredBuffer<SurfaceSprite> surface_sprites: register(t1);
+
+SurfaceSpriteVertexOutput surface_vertex(uint vertex_id: SV_VertexID, uint sprite_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    SurfaceSprite sprite = surface_sprites[sprite_id];
+    float4 device_position = to_device_position(unit_vertex, sprite.bounds);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+
+    SurfaceSpriteVertexOutput output;
+    output.sprite_id = sprite_id;
+    output.position = device_position;
+    output.texture_coords = unit_vertex;
+    output.clip_distance = clip_distance;
+    return output;
+}
+
+float4 surface_fragment(SurfaceSpriteFragmentInput input): SV_Target {
+    SurfaceSprite sprite = surface_sprites[input.sprite_id];
+    float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    float4 color = t_sprite.Sample(s_sprite, input.texture_coords);
+    color.a *= saturate(0.5 - distance);
+    return color;
+}
+
+/*
+**
 **              Underlines
 **
 */
