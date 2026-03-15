@@ -328,7 +328,7 @@ fn main() {
 #[cfg(all(target_os = "macos", feature = "test-support"))]
 mod visual_smoke {
     use super::*;
-    use anyhow::{bail, Result};
+    use anyhow::{Context, Result, bail};
     use image::RgbaImage;
     use nekowg::{Modifiers, VisualTestAppContext, point};
     use nekowg_platform::current_platform;
@@ -345,6 +345,37 @@ mod visual_smoke {
             cx.new(|_| GpuSurfaceClearDemo::new(false))
         })
         .map(Into::into)
+    }
+
+    fn close_demo_window(
+        cx: &mut VisualTestAppContext,
+        window: nekowg::AnyWindowHandle,
+    ) -> Result<()> {
+        cx.update_window(window, |_, window, _cx| {
+            window.remove_window();
+        })?;
+        cx.run_until_parked();
+        Ok(())
+    }
+
+    fn with_demo_window(
+        body: impl FnOnce(&mut VisualTestAppContext, nekowg::AnyWindowHandle) -> Result<()>,
+    ) -> Result<()> {
+        let mut cx = VisualTestAppContext::new(current_platform(false));
+        let window = open_demo_window(&mut cx)?;
+        cx.run_until_parked();
+
+        let result = body(&mut cx, window);
+        let close_result = close_demo_window(&mut cx, window);
+
+        match (result, close_result) {
+            (Err(err), Err(close_err)) => Err(err.context(format!(
+                "visual smoke cleanup failed after test error: {close_err:#}"
+            ))),
+            (Err(err), Ok(())) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
@@ -379,90 +410,84 @@ mod visual_smoke {
     }
 
     fn smoke_renders_non_background_content() -> Result<()> {
-        let mut cx = VisualTestAppContext::new(current_platform(false));
-        let window = open_demo_window(&mut cx)?;
+        with_demo_window(|cx, window| {
+            let screenshot = cx.capture_screenshot(window)?;
 
-        cx.run_until_parked();
-        let screenshot = cx.capture_screenshot(window)?;
-
-        let background = pixel(&screenshot, 20, 20);
-        let center = average_patch(
-            &screenshot,
-            SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
-            SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
-            4,
-        );
-
-        if color_distance(background, center) <= 80 {
-            bail!(
-                "expected gpu surface content to differ from the window background, background={background:?}, center={center:?}"
+            let background = pixel(&screenshot, 20, 20);
+            let center = average_patch(
+                &screenshot,
+                SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
+                SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
+                4,
             );
-        }
-        Ok(())
+
+            if color_distance(background, center) <= 80 {
+                bail!(
+                    "expected gpu surface content to differ from the window background, background={background:?}, center={center:?}"
+                );
+            }
+            Ok(())
+        })
     }
 
     fn smoke_respects_rounded_clip() -> Result<()> {
-        let mut cx = VisualTestAppContext::new(current_platform(false));
-        let window = open_demo_window(&mut cx)?;
+        with_demo_window(|cx, window| {
+            let screenshot = cx.capture_screenshot(window)?;
 
-        cx.run_until_parked();
-        let screenshot = cx.capture_screenshot(window)?;
-
-        let background = pixel(&screenshot, 20, 20);
-        let rounded_corner = average_patch(&screenshot, SURFACE_LEFT + 2, SURFACE_TOP + 2, 1);
-        let center = average_patch(
-            &screenshot,
-            SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
-            SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
-            4,
-        );
-
-        if color_distance(background, rounded_corner) >= 40 {
-            bail!(
-                "expected rounded corner to remain clipped to background, background={background:?}, corner={rounded_corner:?}"
+            let background = pixel(&screenshot, 20, 20);
+            let rounded_corner = average_patch(&screenshot, SURFACE_LEFT + 2, SURFACE_TOP + 2, 1);
+            let center = average_patch(
+                &screenshot,
+                SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
+                SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
+                4,
             );
-        }
-        if color_distance(rounded_corner, center) <= 80 {
-            bail!(
-                "expected clipped corner and interior content to differ, corner={rounded_corner:?}, center={center:?}"
-            );
-        }
-        Ok(())
+
+            if color_distance(background, rounded_corner) >= 40 {
+                bail!(
+                    "expected rounded corner to remain clipped to background, background={background:?}, corner={rounded_corner:?}"
+                );
+            }
+            if color_distance(rounded_corner, center) <= 80 {
+                bail!(
+                    "expected clipped corner and interior content to differ, corner={rounded_corner:?}, center={center:?}"
+                );
+            }
+            Ok(())
+        })
     }
 
     fn smoke_pointer_input_changes_output() -> Result<()> {
-        let mut cx = VisualTestAppContext::new(current_platform(false));
-        let window = open_demo_window(&mut cx)?;
-
-        cx.run_until_parked();
-        let before = cx.capture_screenshot(window)?;
-        let before_center = average_patch(
-            &before,
-            SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
-            SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
-            6,
-        );
-
-        cx.simulate_mouse_move(
-            window,
-            point(px(WINDOW_WIDTH / 2.0), px(WINDOW_HEIGHT / 2.0)),
-            None,
-            Modifiers::default(),
-        );
-        let after = cx.capture_screenshot(window)?;
-        let after_center = average_patch(
-            &after,
-            SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
-            SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
-            6,
-        );
-
-        if color_distance(before_center, after_center) <= 40 {
-            bail!(
-                "expected pointer input to change gpu surface output, before={before_center:?}, after={after_center:?}"
+        with_demo_window(|cx, window| {
+            let before = cx.capture_screenshot(window)?;
+            let before_center = average_patch(
+                &before,
+                SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
+                SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
+                6,
             );
-        }
-        Ok(())
+
+            cx.simulate_mouse_move(
+                window,
+                point(px(WINDOW_WIDTH / 2.0), px(WINDOW_HEIGHT / 2.0)),
+                None,
+                Modifiers::default(),
+            );
+            let after = cx.capture_screenshot(window)?;
+            let after_center = average_patch(
+                &after,
+                SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
+                SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
+                6,
+            );
+
+            if color_distance(before_center, after_center) <= 40 {
+                bail!(
+                    "expected pointer input to change gpu surface output, before={before_center:?}, after={after_center:?}"
+                );
+            }
+            Ok(())
+        })
     }
 
     pub fn run_suite() -> Result<()> {
