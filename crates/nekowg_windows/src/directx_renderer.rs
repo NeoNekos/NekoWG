@@ -3767,7 +3767,7 @@ mod tests {
         };
         let same_texture_different_label = GpuTextureDesc {
             label: Some("second".into()),
-            ..desc.clone()
+            ..desc
         };
 
         pool.recycle((&desc).into(), 7u32);
