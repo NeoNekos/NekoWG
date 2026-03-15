@@ -1881,6 +1881,8 @@ impl DirectXRenderer {
         for (index, surface) in surfaces.iter().enumerate() {
             let texture_view: ID3D11ShaderResourceView = surface
                 .texture_view
+                .as_ref()
+                .context("DX11 surface batch requires a texture view")?
                 .cast()
                 .context("Casting GpuSurface texture view to DX11 SRV")?;
             self.pipelines.surface_pipeline.draw_range_with_texture(
@@ -1932,7 +1934,8 @@ impl DirectXRenderer {
             bounds: input.bounds,
             content_mask: input.content_mask,
             corner_radii: input.corner_radii,
-            texture_view: texture_view.cast()?,
+            texture_view: Some(texture_view.cast()?),
+            gpu_surface_id: None,
         }))
     }
 

@@ -27,7 +27,7 @@ default-members = ["crates/nekowg"]
 
 [workspace.package]
 publish = false
-version = "0.2.30"
+version = "0.2.31"
 edition = "2024"
 
 [workspace.dependencies]

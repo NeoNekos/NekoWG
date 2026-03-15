@@ -3,11 +3,12 @@ use x11rb::connection::RequestConnection;
 
 use crate::linux::X11ClientStatePtr;
 use nekowg::{
-    AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowKind, WindowParams, px,
+    AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs,
+    GpuSurfaceExecutionInput, Modifiers, PaintSurface, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size, Tiling, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowDecorations, WindowKind,
+    WindowParams, px,
 };
 use nekowg_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -1656,6 +1657,17 @@ impl PlatformWindow for X11Window {
         }
 
         inner.renderer.draw(scene);
+    }
+
+    fn paint_gpu_surface(&self, input: GpuSurfaceExecutionInput<'_>) -> Option<PaintSurface> {
+        self.0
+            .state
+            .borrow_mut()
+            .renderer
+            .paint_gpu_surface(input)
+            .map_err(|err| log::error!("x11 wgpu surface execution failed: {err:#}"))
+            .ok()
+            .flatten()
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

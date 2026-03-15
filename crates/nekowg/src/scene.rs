@@ -772,9 +772,10 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    pub image_buffer: Option<core_video::pixel_buffer::CVPixelBuffer>,
     #[cfg(target_os = "windows")]
-    pub texture_view: windows::core::IUnknown,
+    pub texture_view: Option<windows::core::IUnknown>,
+    pub gpu_surface_id: Option<u64>,
 }
 
 impl From<PaintSurface> for Primitive {

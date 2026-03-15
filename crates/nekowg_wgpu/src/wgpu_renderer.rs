@@ -1,13 +1,20 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
+use anyhow::Context as _;
 use bytemuck::{Pod, Zeroable};
 use log::warn;
 use nekowg::{
-    AtlasTextureId, BackdropFilter, Background, Bounds, Corners, DevicePixels, GpuSpecs, Hsla,
-    MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
-    Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios, point, size,
+    AtlasTextureId, BackdropFilter, Background, Bounds, Corners, DevicePixels, GpuBinding,
+    GpuBufferDesc, GpuBufferHandle, GpuBufferUsage, GpuBufferWrite, GpuClearColor,
+    GpuComputePassDesc, GpuComputeProgramDesc, GpuComputeProgramHandle, GpuDrawCall,
+    GpuFrameContext, GpuGraphOperation, GpuRecordedGraph, GpuRenderPassDesc, GpuRenderProgramDesc,
+    GpuRenderProgramHandle, GpuSamplerDesc, GpuSamplerHandle, GpuSpecs, GpuSurfaceExecutionInput,
+    GpuTextureDesc, GpuTextureFormat, GpuTextureHandle, Hsla, MonochromeSprite, PaintSurface,
+    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
+    SubpixelSprite, Underline, get_gamma_correction_ratios, point, px, size,
 };
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use std::collections::HashMap;
 use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::rc::Rc;
@@ -42,6 +49,15 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    corner_radii: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GpuSurfaceFrameUniform {
+    metrics: [f32; 4],
+    extent_cursor: [f32; 4],
+    surface_cursor: [f32; 4],
 }
 
 #[repr(C)]
@@ -153,6 +169,7 @@ struct WgpuPipelines {
     poly_sprites: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
+    gpu_surfaces: wgpu::RenderPipeline,
 }
 
 struct WgpuBindGroupLayouts {
@@ -195,6 +212,528 @@ struct WgpuResources {
     path_msaa_view: Option<wgpu::TextureView>,
 }
 
+struct WgpuGpuSurfaceState {
+    textures: HashMap<GpuTextureHandle, WgpuGpuSurfaceTexture>,
+    buffers: HashMap<GpuBufferHandle, WgpuGpuSurfaceBuffer>,
+    samplers: HashMap<GpuSamplerHandle, WgpuGpuSurfaceSampler>,
+    render_programs: HashMap<GpuRenderProgramHandle, WgpuGpuSurfaceRenderProgram>,
+    compute_programs: HashMap<GpuComputeProgramHandle, WgpuGpuSurfaceComputeProgram>,
+    frame_uniform_buffer: wgpu::Buffer,
+    presented: Option<GpuTextureHandle>,
+    last_used_frame: u64,
+}
+
+struct WgpuGpuSurfaceTexture {
+    desc: GpuTextureDesc,
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+struct WgpuGpuSurfaceBuffer {
+    desc: GpuBufferDesc,
+    buffer: wgpu::Buffer,
+}
+
+struct WgpuGpuSurfaceSampler {
+    desc: GpuSamplerDesc,
+    sampler: wgpu::Sampler,
+}
+
+struct WgpuGpuSurfaceRenderProgram {
+    desc: GpuRenderProgramDesc,
+    module: wgpu::ShaderModule,
+    pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+}
+
+struct WgpuGpuSurfaceComputeProgram {
+    desc: GpuComputeProgramDesc,
+    pipeline: wgpu::ComputePipeline,
+}
+
+impl WgpuGpuSurfaceState {
+    fn new(device: &wgpu::Device) -> Self {
+        let frame_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_surface_frame_uniform"),
+            size: std::mem::size_of::<GpuSurfaceFrameUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            textures: HashMap::default(),
+            buffers: HashMap::default(),
+            samplers: HashMap::default(),
+            render_programs: HashMap::default(),
+            compute_programs: HashMap::default(),
+            frame_uniform_buffer,
+            presented: None,
+            last_used_frame: 0,
+        }
+    }
+
+    fn sync_textures(
+        &mut self,
+        device: &wgpu::Device,
+        textures: &HashMap<GpuTextureHandle, GpuTextureDesc>,
+    ) -> anyhow::Result<()> {
+        self.textures.retain(|handle, _| textures.contains_key(handle));
+        for (&handle, desc) in textures {
+            let needs_recreate = self
+                .textures
+                .get(&handle)
+                .is_none_or(|texture| texture.desc != *desc);
+            if needs_recreate {
+                self.textures
+                    .insert(handle, create_gpu_surface_texture(device, desc)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_buffers(
+        &mut self,
+        device: &wgpu::Device,
+        buffers: &HashMap<GpuBufferHandle, GpuBufferDesc>,
+    ) -> anyhow::Result<()> {
+        self.buffers.retain(|handle, _| buffers.contains_key(handle));
+        for (&handle, desc) in buffers {
+            let needs_recreate = self
+                .buffers
+                .get(&handle)
+                .is_none_or(|buffer| buffer.desc != *desc);
+            if needs_recreate {
+                self.buffers
+                    .insert(handle, create_gpu_surface_buffer(device, desc)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_samplers(
+        &mut self,
+        device: &wgpu::Device,
+        samplers: &HashMap<GpuSamplerHandle, GpuSamplerDesc>,
+    ) {
+        self.samplers.retain(|handle, _| samplers.contains_key(handle));
+        for (&handle, desc) in samplers {
+            let needs_recreate = self
+                .samplers
+                .get(&handle)
+                .is_none_or(|sampler| sampler.desc != *desc);
+            if needs_recreate {
+                self.samplers.insert(
+                    handle,
+                    WgpuGpuSurfaceSampler {
+                        desc: desc.clone(),
+                        sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                            label: desc.label.as_ref().map(|label| label.as_ref()),
+                            mag_filter: wgpu::FilterMode::Linear,
+                            min_filter: wgpu::FilterMode::Linear,
+                            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+                            address_mode_u: wgpu::AddressMode::ClampToEdge,
+                            address_mode_v: wgpu::AddressMode::ClampToEdge,
+                            address_mode_w: wgpu::AddressMode::ClampToEdge,
+                            ..Default::default()
+                        }),
+                    },
+                );
+            }
+        }
+    }
+
+    fn sync_render_programs(
+        &mut self,
+        device: &wgpu::Device,
+        render_programs: &HashMap<GpuRenderProgramHandle, GpuRenderProgramDesc>,
+    ) {
+        self.render_programs
+            .retain(|handle, _| render_programs.contains_key(handle));
+        for (&handle, desc) in render_programs {
+            let needs_recreate = self
+                .render_programs
+                .get(&handle)
+                .is_none_or(|program| program.desc != *desc);
+            if needs_recreate {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: desc.label.as_ref().map(|label| label.as_ref()),
+                    source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(desc.wgsl.as_ref())),
+                });
+                self.render_programs.insert(
+                    handle,
+                    WgpuGpuSurfaceRenderProgram {
+                        desc: desc.clone(),
+                        module,
+                        pipelines: HashMap::default(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn sync_compute_programs(
+        &mut self,
+        device: &wgpu::Device,
+        compute_programs: &HashMap<GpuComputeProgramHandle, GpuComputeProgramDesc>,
+    ) {
+        self.compute_programs
+            .retain(|handle, _| compute_programs.contains_key(handle));
+        for (&handle, desc) in compute_programs {
+            let needs_recreate = self
+                .compute_programs
+                .get(&handle)
+                .is_none_or(|program| program.desc != *desc);
+            if needs_recreate {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: desc.label.as_ref().map(|label| label.as_ref()),
+                    source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(desc.wgsl.as_ref())),
+                });
+                let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: desc.label.as_ref().map(|label| label.as_ref()),
+                    layout: None,
+                    module: &module,
+                    entry_point: Some(desc.entry.as_ref()),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: None,
+                });
+                self.compute_programs.insert(
+                    handle,
+                    WgpuGpuSurfaceComputeProgram {
+                        desc: desc.clone(),
+                        pipeline,
+                    },
+                );
+            }
+        }
+    }
+
+    fn execute_graph(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &GpuFrameContext,
+        scale_factor: f32,
+        graph: &GpuRecordedGraph,
+    ) -> anyhow::Result<()> {
+        queue.write_buffer(
+            &self.frame_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&gpu_surface_frame_uniform(frame, scale_factor)),
+        );
+        self.apply_buffer_writes(queue, graph.buffer_writes())?;
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu_surface_graph_encoder"),
+        });
+
+        for operation in &graph.operations {
+            match operation {
+                GpuGraphOperation::RenderPass(pass) => {
+                    self.execute_render_pass(device, &mut encoder, pass)?
+                }
+                GpuGraphOperation::ComputePass(pass) => {
+                    self.execute_compute_pass(device, &mut encoder, pass)?
+                }
+            }
+        }
+
+        queue.submit(std::iter::once(encoder.finish()));
+        self.presented = graph.presented;
+        Ok(())
+    }
+
+    fn apply_buffer_writes(
+        &self,
+        queue: &wgpu::Queue,
+        writes: &[GpuBufferWrite],
+    ) -> anyhow::Result<()> {
+        for write in writes {
+            let buffer = self
+                .buffers
+                .get(&write.buffer)
+                .context("GpuSurface buffer write target missing in WGPU state")?;
+            let end = write.offset + write.data.len() as u64;
+            if end > buffer.desc.size {
+                anyhow::bail!(
+                    "GpuSurface buffer write exceeds buffer bounds on WGPU execution: offset {}, size {}, capacity {}",
+                    write.offset,
+                    write.data.len(),
+                    buffer.desc.size
+                );
+            }
+            queue.write_buffer(&buffer.buffer, write.offset, &write.data);
+        }
+        Ok(())
+    }
+
+    fn execute_render_pass(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pass: &GpuRenderPassDesc,
+    ) -> anyhow::Result<()> {
+        let (target_desc, target_view) = {
+            let target = self
+                .textures
+                .get(&pass.target)
+                .context("GpuSurface render pass target missing in WGPU state")?;
+            (target.desc.clone(), target.view.clone())
+        };
+
+        if !target_desc.render_attachment {
+            anyhow::bail!("GpuSurface render target is not renderable on WGPU");
+        }
+
+        let pipeline = self
+            .render_pipeline(device, pass.program, gpu_texture_format_to_wgpu(target_desc.format))?
+            .clone();
+        let bind_group_layout = pipeline.get_bind_group_layout(0);
+        let bind_group_entries = self.bind_group_entries(&self.frame_uniform_buffer, &pass.bindings)?;
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: pass.label.as_ref().map(|label| label.as_ref()),
+            layout: &bind_group_layout,
+            entries: &bind_group_entries,
+        });
+
+        let load = if let Some(clear) = pass.clear_color {
+            wgpu::LoadOp::Clear(gpu_clear_color_to_wgpu(clear))
+        } else {
+            wgpu::LoadOp::Load
+        };
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: pass.label.as_ref().map(|label| label.as_ref()),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        render_pass.set_pipeline(&pipeline);
+        render_pass.set_bind_group(0, &bind_group, &[]);
+        render_pass.set_viewport(
+            0.0,
+            0.0,
+            target_desc.extent.width.max(1) as f32,
+            target_desc.extent.height.max(1) as f32,
+            0.0,
+            1.0,
+        );
+        render_pass.set_scissor_rect(
+            0,
+            0,
+            target_desc.extent.width.max(1),
+            target_desc.extent.height.max(1),
+        );
+        match pass.draw {
+            GpuDrawCall::FullScreenTriangle => render_pass.draw(0..3, 0..1),
+            GpuDrawCall::Triangles {
+                vertex_count,
+                instance_count,
+            } => render_pass.draw(0..vertex_count, 0..instance_count),
+        }
+        Ok(())
+    }
+
+    fn execute_compute_pass(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        pass: &GpuComputePassDesc,
+    ) -> anyhow::Result<()> {
+        if pass.workgroups.contains(&0) {
+            return Ok(());
+        }
+
+        let pipeline = self
+            .compute_programs
+            .get(&pass.program)
+            .context("GpuSurface compute program missing in WGPU state")?
+            .pipeline
+            .clone();
+        let bind_group_layout = pipeline.get_bind_group_layout(0);
+        let bind_group_entries = self.bind_group_entries(&self.frame_uniform_buffer, &pass.bindings)?;
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: pass.label.as_ref().map(|label| label.as_ref()),
+            layout: &bind_group_layout,
+            entries: &bind_group_entries,
+        });
+
+        let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: pass.label.as_ref().map(|label| label.as_ref()),
+            ..Default::default()
+        });
+        compute_pass.set_pipeline(&pipeline);
+        compute_pass.set_bind_group(0, &bind_group, &[]);
+        compute_pass.dispatch_workgroups(pass.workgroups[0], pass.workgroups[1], pass.workgroups[2]);
+        Ok(())
+    }
+
+    fn bind_group_entries<'a>(
+        &'a self,
+        frame_uniform_buffer: &'a wgpu::Buffer,
+        bindings: &[GpuBinding],
+    ) -> anyhow::Result<Vec<wgpu::BindGroupEntry<'a>>> {
+        let mut entries = Vec::with_capacity(bindings.len() + 1);
+        entries.push(wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: frame_uniform_buffer,
+                offset: 0,
+                size: NonZeroU64::new(std::mem::size_of::<GpuSurfaceFrameUniform>() as u64),
+            }),
+        });
+
+        for (index, binding) in bindings.iter().enumerate() {
+            let slot = (index + 1) as u32;
+            match *binding {
+                GpuBinding::UniformBuffer(handle) => {
+                    let buffer = self
+                        .buffers
+                        .get(&handle)
+                        .context("GpuSurface uniform buffer binding missing in WGPU state")?;
+                    if buffer.desc.usage != GpuBufferUsage::Uniform {
+                        anyhow::bail!("GpuSurface uniform binding points to a non-uniform buffer");
+                    }
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: slot,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &buffer.buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    });
+                }
+                GpuBinding::StorageBuffer(handle) => {
+                    let buffer = self
+                        .buffers
+                        .get(&handle)
+                        .context("GpuSurface storage buffer binding missing in WGPU state")?;
+                    if buffer.desc.usage != GpuBufferUsage::Storage {
+                        anyhow::bail!("GpuSurface storage binding points to a non-storage buffer");
+                    }
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: slot,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &buffer.buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    });
+                }
+                GpuBinding::SampledTexture(handle) => {
+                    let texture = self
+                        .textures
+                        .get(&handle)
+                        .context("GpuSurface sampled texture binding missing in WGPU state")?;
+                    if !texture.desc.sampled {
+                        anyhow::bail!("GpuSurface sampled binding points to a non-sampled texture");
+                    }
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: slot,
+                        resource: wgpu::BindingResource::TextureView(&texture.view),
+                    });
+                }
+                GpuBinding::StorageTexture(handle) => {
+                    let texture = self
+                        .textures
+                        .get(&handle)
+                        .context("GpuSurface storage texture binding missing in WGPU state")?;
+                    if !texture.desc.storage {
+                        anyhow::bail!("GpuSurface storage binding points to a non-storage texture");
+                    }
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: slot,
+                        resource: wgpu::BindingResource::TextureView(&texture.view),
+                    });
+                }
+                GpuBinding::Sampler(handle) => {
+                    let sampler = self
+                        .samplers
+                        .get(&handle)
+                        .context("GpuSurface sampler binding missing in WGPU state")?;
+                    entries.push(wgpu::BindGroupEntry {
+                        binding: slot,
+                        resource: wgpu::BindingResource::Sampler(&sampler.sampler),
+                    });
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
+    fn render_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        handle: GpuRenderProgramHandle,
+        target_format: wgpu::TextureFormat,
+    ) -> anyhow::Result<&wgpu::RenderPipeline> {
+        let program = self
+            .render_programs
+            .get_mut(&handle)
+            .context("GpuSurface render program missing in WGPU state")?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = program.pipelines.entry(target_format)
+        {
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: program.desc.label.as_ref().map(|label| label.as_ref()),
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module: &program.module,
+                    entry_point: Some(program.desc.vertex_entry.as_ref()),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &program.module,
+                    entry_point: Some(program.desc.fragment_entry.as_ref()),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            entry.insert(pipeline);
+        }
+        Ok(program
+            .pipelines
+            .get(&target_format)
+            .expect("render pipeline must exist after insertion"))
+    }
+
+    fn presented_view(&self) -> anyhow::Result<&wgpu::TextureView> {
+        let presented = self
+            .presented
+            .context("GpuSurface present texture missing in WGPU state")?;
+        let texture = self
+            .textures
+            .get(&presented)
+            .context("GpuSurface present texture missing in WGPU state")?;
+        if !texture.desc.sampled {
+            anyhow::bail!("GpuSurface present texture is not sampleable on WGPU");
+        }
+        Ok(&texture.view)
+    }
+}
+
 pub struct WgpuRenderer {
     /// Shared GPU context for device recovery coordination (unused on WASM).
     #[allow(dead_code)]
@@ -218,6 +757,8 @@ pub struct WgpuRenderer {
     max_texture_size: u32,
     last_error: Arc<Mutex<Option<String>>>,
     failed_frame_count: u32,
+    gpu_surfaces: HashMap<u64, WgpuGpuSurfaceState>,
+    gpu_surface_frame_serial: u64,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -559,6 +1100,8 @@ impl WgpuRenderer {
             max_texture_size,
             last_error,
             failed_frame_count: 0,
+            gpu_surfaces: HashMap::default(),
+            gpu_surface_frame_serial: 0,
             device_lost: context.device_lost_flag(),
         })
     }
@@ -969,6 +1512,22 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let gpu_surfaces = create_pipeline(
+            "gpu_surfaces",
+            "vs_surface",
+            "fs_gpu_surface",
+            &layouts.globals,
+            &layouts.surfaces,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: Some(blend_mode),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
         WgpuPipelines {
             quads,
             shadows,
@@ -982,6 +1541,7 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            gpu_surfaces,
         }
     }
 
@@ -1301,6 +1861,53 @@ impl WgpuRenderer {
         }
     }
 
+    fn prune_stale_gpu_surfaces(&mut self) {
+        const RETAIN_FRAMES: u64 = 120;
+        let min_frame = self.gpu_surface_frame_serial.saturating_sub(RETAIN_FRAMES);
+        self.gpu_surfaces
+            .retain(|_, state| state.last_used_frame >= min_frame);
+    }
+
+    pub fn paint_gpu_surface(
+        &mut self,
+        input: GpuSurfaceExecutionInput<'_>,
+    ) -> anyhow::Result<Option<PaintSurface>> {
+        let Some(_) = input.graph.presented else {
+            return Ok(None);
+        };
+        let frame = input
+            .frame
+            .context("GpuSurface WGPU executor requires a prepared frame context")?;
+        let (device, queue) = {
+            let resources = self.resources();
+            (Arc::clone(&resources.device), Arc::clone(&resources.queue))
+        };
+        let state = self
+            .gpu_surfaces
+            .entry(input.surface_id)
+            .or_insert_with(|| WgpuGpuSurfaceState::new(&device));
+        state.last_used_frame = self.gpu_surface_frame_serial + 1;
+        state.sync_textures(&device, input.textures)?;
+        state.sync_buffers(&device, input.buffers)?;
+        state.sync_samplers(&device, input.samplers);
+        state.sync_render_programs(&device, input.render_programs);
+        state.sync_compute_programs(&device, input.compute_programs);
+        state.execute_graph(&device, &queue, frame, input.scale_factor, input.graph)?;
+        let _ = state.presented_view()?;
+
+        Ok(Some(PaintSurface {
+            order: 0,
+            bounds: input.bounds,
+            content_mask: input.content_mask,
+            corner_radii: input.corner_radii,
+            #[cfg(target_os = "macos")]
+            image_buffer: None,
+            #[cfg(target_os = "windows")]
+            texture_view: None,
+            gpu_surface_id: Some(input.surface_id),
+        }))
+    }
+
     pub fn max_texture_size(&self) -> u32 {
         self.max_texture_size
     }
@@ -1321,6 +1928,8 @@ impl WgpuRenderer {
         }
 
         self.atlas.before_frame();
+        self.gpu_surface_frame_serial = self.gpu_surface_frame_serial.wrapping_add(1);
+        self.prune_stale_gpu_surfaces();
 
         let texture_result = self.resources().surface.get_current_texture();
         let frame = match texture_result {
@@ -1532,11 +2141,11 @@ impl WgpuRenderer {
                                 &mut instance_offset,
                                 &mut pass,
                             ),
-                        PrimitiveBatch::Surfaces(_surfaces) => {
-                            // Surfaces are macOS-only for video playback
-                            // Not implemented for Linux/wgpu
-                            true
-                        }
+                        PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
+                            &scene.surfaces[range],
+                            &mut instance_offset,
+                            &mut pass,
+                        ),
                     };
                     if !ok {
                         overflow = true;
@@ -1702,6 +2311,85 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    fn draw_surfaces(
+        &self,
+        surfaces: &[PaintSurface],
+        _instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        if surfaces.is_empty() {
+            return true;
+        }
+
+        let resources = self.resources();
+        for surface in surfaces {
+            let Some(surface_id) = surface.gpu_surface_id else {
+                continue;
+            };
+            let Some(state) = self.gpu_surfaces.get(&surface_id) else {
+                continue;
+            };
+            let Ok(texture_view) = state.presented_view() else {
+                continue;
+            };
+
+            let params = SurfaceParams {
+                bounds: surface.bounds.into(),
+                content_mask: surface.content_mask.bounds.into(),
+                corner_radii: [
+                    surface.corner_radii.top_left.0,
+                    surface.corner_radii.top_right.0,
+                    surface.corner_radii.bottom_right.0,
+                    surface.corner_radii.bottom_left.0,
+                ],
+            };
+            let params_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("surface_params_buffer"),
+                size: std::mem::size_of::<SurfaceParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            resources
+                .queue
+                .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+            let bind_group = resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("gpu_surface_bind_group"),
+                    layout: &resources.bind_group_layouts.surfaces,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &params_buffer,
+                                offset: 0,
+                                size: NonZeroU64::new(std::mem::size_of::<SurfaceParams>() as u64),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(texture_view),
+                        },
+                        // Binding 2 is unused by the GPU surface path, but required by layout.
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(texture_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                        },
+                    ],
+                });
+            pass.set_pipeline(&resources.pipelines.gpu_surfaces);
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+
+        true
     }
 
     fn draw_instances(
@@ -2425,6 +3113,124 @@ impl WgpuRenderer {
 
         log::info!("GPU recovery complete");
         Ok(())
+    }
+}
+
+fn create_gpu_surface_texture(
+    device: &wgpu::Device,
+    desc: &GpuTextureDesc,
+) -> anyhow::Result<WgpuGpuSurfaceTexture> {
+    let mut usage = wgpu::TextureUsages::empty();
+    if desc.sampled {
+        usage |= wgpu::TextureUsages::TEXTURE_BINDING;
+    }
+    if desc.storage {
+        usage |= wgpu::TextureUsages::STORAGE_BINDING;
+    }
+    if desc.render_attachment {
+        usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
+    }
+    if desc.copy_src {
+        usage |= wgpu::TextureUsages::COPY_SRC;
+    }
+    if desc.copy_dst {
+        usage |= wgpu::TextureUsages::COPY_DST;
+    }
+    if usage.is_empty() {
+        anyhow::bail!("GpuSurface texture usage cannot be empty for WGPU");
+    }
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: desc.label.as_ref().map(|label| label.as_ref()),
+        size: wgpu::Extent3d {
+            width: desc.extent.width.max(1),
+            height: desc.extent.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: gpu_texture_format_to_wgpu(desc.format),
+        usage,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    Ok(WgpuGpuSurfaceTexture {
+        desc: desc.clone(),
+        _texture: texture,
+        view,
+    })
+}
+
+fn create_gpu_surface_buffer(
+    device: &wgpu::Device,
+    desc: &GpuBufferDesc,
+) -> anyhow::Result<WgpuGpuSurfaceBuffer> {
+    let usage = match desc.usage {
+        GpuBufferUsage::Uniform => wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        GpuBufferUsage::Storage => wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    };
+    let size = desc.size.max(16);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: desc.label.as_ref().map(|label| label.as_ref()),
+        size,
+        usage,
+        mapped_at_creation: false,
+    });
+    Ok(WgpuGpuSurfaceBuffer {
+        desc: desc.clone(),
+        buffer,
+    })
+}
+
+fn gpu_texture_format_to_wgpu(format: GpuTextureFormat) -> wgpu::TextureFormat {
+    match format {
+        GpuTextureFormat::Rgba8Unorm => wgpu::TextureFormat::Rgba8Unorm,
+        GpuTextureFormat::Bgra8Unorm => wgpu::TextureFormat::Bgra8Unorm,
+        GpuTextureFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
+        GpuTextureFormat::R32Float => wgpu::TextureFormat::R32Float,
+        GpuTextureFormat::Rgba32Float => wgpu::TextureFormat::Rgba32Float,
+    }
+}
+
+fn gpu_surface_frame_uniform(frame: &GpuFrameContext, scale_factor: f32) -> GpuSurfaceFrameUniform {
+    let surface_cursor_position = frame
+        .surface_cursor_position
+        .unwrap_or(point(px(0.0), px(0.0)))
+        .scale(scale_factor);
+    let cursor_position = frame.cursor_position.scale(scale_factor);
+    GpuSurfaceFrameUniform {
+        metrics: [
+            frame.time.as_secs_f32(),
+            frame.delta_time.as_secs_f32(),
+            frame.frame_index as f32,
+            if frame.surface_cursor_position.is_some() {
+                1.0
+            } else {
+                0.0
+            },
+        ],
+        extent_cursor: [
+            frame.extent.width as f32,
+            frame.extent.height as f32,
+            cursor_position.x.as_f32(),
+            cursor_position.y.as_f32(),
+        ],
+        surface_cursor: [
+            surface_cursor_position.x.as_f32(),
+            surface_cursor_position.y.as_f32(),
+            0.0,
+            0.0,
+        ],
+    }
+}
+
+fn gpu_clear_color_to_wgpu(clear: GpuClearColor) -> wgpu::Color {
+    wgpu::Color {
+        r: clear.r as f64,
+        g: clear.g as f64,
+        b: clear.b as f64,
+        a: clear.a as f64,
     }
 }
 

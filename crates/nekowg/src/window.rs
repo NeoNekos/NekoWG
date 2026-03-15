@@ -3644,7 +3644,8 @@ impl Window {
             bounds,
             content_mask,
             corner_radii: Default::default(),
-            image_buffer,
+            image_buffer: Some(image_buffer),
+            gpu_surface_id: None,
         });
     }
 
