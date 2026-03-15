@@ -765,7 +765,7 @@ impl MetalRenderer {
             .as_ref()
             .map(|texture| texture.as_ref());
 
-        let clear_color = metal::MTLClearColor::new(0.0, 0.0, 0.0, alpha as f64);
+        let clear_color = metal::MTLClearColor::new(0.0, 0.0, 0.0, alpha);
 
         let mut command_encoder = if let Some(main_texture) = main_texture {
             new_texture_command_encoder(
@@ -1596,8 +1596,8 @@ impl MetalRenderer {
 
             let target_size_u32 = match scale {
                 1 => full_size,
-                2 => [(full_size[0] + 1) / 2, (full_size[1] + 1) / 2],
-                _ => [(full_size[0] + 3) / 4, (full_size[1] + 3) / 4],
+                2 => [full_size[0].div_ceil(2), full_size[1].div_ceil(2)],
+                _ => [full_size[0].div_ceil(4), full_size[1].div_ceil(4)],
             };
             let target_size_f = [target_size_u32[0] as f32, target_size_u32[1] as f32];
             let scissor_expanded = Self::scissor_from_bounds(expanded_scaled, target_size_u32);

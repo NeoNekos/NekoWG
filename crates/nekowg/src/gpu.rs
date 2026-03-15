@@ -1048,6 +1048,36 @@ mod tests {
         assert_eq!(runtime.resources.textures.len(), 1);
     }
 
+    struct FrameTimingRenderer;
+
+    impl GpuSurfaceRenderer for FrameTimingRenderer {
+        fn update(&mut self, _next_renderer: Self) {}
+    }
+
+    #[test]
+    fn prepare_frame_advances_frame_index_and_updates_last_frame() {
+        let mut runtime = GpuSurfaceRuntime::new(FrameTimingRenderer);
+        runtime.ensure_initialized();
+
+        let extent = GpuExtent {
+            width: 64,
+            height: 32,
+        };
+        let first = runtime.prepare_frame(extent, crate::point(crate::px(4.0), crate::px(8.0)), None);
+        assert_eq!(first.frame_index, 0);
+        assert_eq!(runtime.frame_index, 1);
+        assert_eq!(runtime.last_frame.as_ref().map(|frame| frame.extent), Some(extent));
+
+        let second = runtime.prepare_frame(
+            extent,
+            crate::point(crate::px(5.0), crate::px(9.0)),
+            Some(crate::point(crate::px(1.0), crate::px(2.0))),
+        );
+        assert_eq!(second.frame_index, 1);
+        assert_eq!(runtime.frame_index, 2);
+        assert!(second.time >= first.time);
+    }
+
     #[test]
     fn graph_records_buffer_writes() {
         let mut resources = GpuResourceRegistry::default();
@@ -1248,6 +1278,39 @@ mod tests {
         assert_eq!(
             error,
             GpuGraphValidationError::MissingTexture(GpuTextureHandle(999))
+        );
+    }
+
+    struct MissingRenderProgramRenderer;
+
+    impl GpuSurfaceRenderer for MissingRenderProgramRenderer {
+        fn update(&mut self, _next_renderer: Self) {}
+
+        fn encode(&mut self, graph: &mut GpuGraphContext<'_>) {
+            let target = graph.transient_texture(GpuTextureDesc {
+                render_attachment: true,
+                ..GpuTextureDesc::default()
+            });
+            graph.render_pass(GpuRenderPassDesc {
+                label: Some("missing_program".into()),
+                program: GpuRenderProgramHandle(123),
+                target,
+                clear_color: None,
+                bindings: Vec::new(),
+                draw: GpuDrawCall::FullScreenTriangle,
+            });
+            graph.present(target);
+        }
+    }
+
+    #[test]
+    fn encode_frame_rejects_missing_render_program() {
+        let mut runtime = GpuSurfaceRuntime::new(MissingRenderProgramRenderer);
+        let error = runtime.encode_frame().unwrap_err();
+
+        assert_eq!(
+            error,
+            GpuGraphValidationError::MissingRenderProgram(GpuRenderProgramHandle(123))
         );
     }
 }
