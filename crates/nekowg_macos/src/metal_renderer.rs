@@ -16,7 +16,7 @@ use nekowg::{
     GpuRenderProgramHandle, GpuSamplerDesc, GpuSamplerHandle, GpuSurfaceExecutionInput,
     GpuTextureDesc, GpuTextureFormat, GpuTextureHandle, Hsla, MonochromeSprite, PaintSurface,
     Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, px, size,
+    Underline, point, px, size,
 };
 
 use core_foundation::base::TCFType;

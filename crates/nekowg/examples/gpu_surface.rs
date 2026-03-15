@@ -378,6 +378,16 @@ mod visual_smoke {
         }
     }
 
+    fn capture_current_frame(
+        cx: &mut VisualTestAppContext,
+        window: nekowg::AnyWindowHandle,
+    ) -> Result<RgbaImage> {
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear();
+        })?;
+        cx.capture_screenshot(window)
+    }
+
     fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
         image.get_pixel(x, y).0
     }
@@ -411,7 +421,7 @@ mod visual_smoke {
 
     fn smoke_renders_non_background_content() -> Result<()> {
         with_demo_window(|cx, window| {
-            let screenshot = cx.capture_screenshot(window)?;
+            let screenshot = capture_current_frame(cx, window)?;
 
             let background = pixel(&screenshot, 20, 20);
             let center = average_patch(
@@ -432,7 +442,7 @@ mod visual_smoke {
 
     fn smoke_respects_rounded_clip() -> Result<()> {
         with_demo_window(|cx, window| {
-            let screenshot = cx.capture_screenshot(window)?;
+            let screenshot = capture_current_frame(cx, window)?;
 
             let background = pixel(&screenshot, 20, 20);
             let rounded_corner = average_patch(&screenshot, SURFACE_LEFT + 2, SURFACE_TOP + 2, 1);
@@ -459,7 +469,7 @@ mod visual_smoke {
 
     fn smoke_pointer_input_changes_output() -> Result<()> {
         with_demo_window(|cx, window| {
-            let before = cx.capture_screenshot(window)?;
+            let before = capture_current_frame(cx, window)?;
             let before_center = average_patch(
                 &before,
                 SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
@@ -473,7 +483,7 @@ mod visual_smoke {
                 None,
                 Modifiers::default(),
             );
-            let after = cx.capture_screenshot(window)?;
+            let after = capture_current_frame(cx, window)?;
             let after_center = average_patch(
                 &after,
                 SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
