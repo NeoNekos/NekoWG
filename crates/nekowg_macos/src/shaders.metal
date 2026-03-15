@@ -888,6 +888,13 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   return ycbcrToRGBTransform * ycbcr;
 }
 
+fragment float4 surface_rgb_fragment(
+    SurfaceFragmentInput input [[stage_in]],
+    texture2d<float> color_texture [[texture(SurfaceInputIndex_YTexture)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  return color_texture.sample(texture_sampler, input.texture_position);
+}
+
 struct BackdropBlurVertexOutput {
   float4 position [[position]];
   float2 uv;

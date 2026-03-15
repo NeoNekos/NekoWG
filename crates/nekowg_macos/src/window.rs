@@ -26,10 +26,11 @@ use dispatch2::DispatchQueue;
 use image::RgbaImage;
 use nekowg::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, ExternalPaths, FileDropEvent,
-    ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
+    ForegroundExecutor, GpuSurfaceExecutionInput, KeyDownEvent, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintSurface,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab,
+    WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams, point,
     px, size,
 };
@@ -1570,6 +1571,16 @@ impl PlatformWindow for MacWindow {
     fn draw(&self, scene: &nekowg::Scene) {
         let mut this = self.0.lock();
         this.renderer.draw(scene);
+    }
+
+    fn paint_gpu_surface(&self, input: GpuSurfaceExecutionInput<'_>) -> Option<PaintSurface> {
+        self.0
+            .lock()
+            .renderer
+            .paint_gpu_surface(input)
+            .map_err(|err| log::error!("macOS Metal surface execution failed: {err:#}"))
+            .ok()
+            .flatten()
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

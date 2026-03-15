@@ -3381,6 +3381,7 @@ dependencies = [
  "mach2",
  "media",
  "metal",
+ "naga 28.0.0",
  "nekowg",
  "objc",
  "parking_lot",
