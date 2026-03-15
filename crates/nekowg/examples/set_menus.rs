@@ -40,7 +40,6 @@ fn main() {
     run_example();
 }
 
-
 #[derive(PartialEq)]
 enum ViewMode {
     List,

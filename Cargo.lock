@@ -3222,7 +3222,7 @@ dependencies = [
 
 [[package]]
 name = "nekowg"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -3308,7 +3308,7 @@ dependencies = [
 
 [[package]]
 name = "nekowg_linux"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "anyhow",
  "as-raw-xcb-connection",
@@ -3355,7 +3355,7 @@ dependencies = [
 
 [[package]]
 name = "nekowg_macos"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "anyhow",
  "async-task",
@@ -3381,6 +3381,7 @@ dependencies = [
  "mach2",
  "media",
  "metal",
+ "naga 28.0.0",
  "nekowg",
  "objc",
  "parking_lot",
@@ -3396,7 +3397,7 @@ dependencies = [
 
 [[package]]
 name = "nekowg_macros"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "heck 0.5.0",
  "nekowg",
@@ -3407,7 +3408,7 @@ dependencies = [
 
 [[package]]
 name = "nekowg_platform"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "nekowg",
  "nekowg_linux",
@@ -3417,7 +3418,7 @@ dependencies = [
 
 [[package]]
 name = "nekowg_util"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "anyhow",
  "log",
@@ -3425,7 +3426,7 @@ dependencies = [
 
 [[package]]
 name = "nekowg_wgpu"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -3448,7 +3449,7 @@ dependencies = [
 
 [[package]]
 name = "nekowg_windows"
-version = "0.2.31"
+version = "0.2.32"
 dependencies = [
  "anyhow",
  "collections",

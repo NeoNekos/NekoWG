@@ -117,10 +117,13 @@ struct ClearSurfaceRenderer {
     sampler: Option<GpuSamplerHandle>,
     extent: GpuExtent,
     time: f32,
+    animate: bool,
 }
 
 impl GpuSurfaceRenderer for ClearSurfaceRenderer {
-    fn update(&mut self, _next_renderer: Self) {}
+    fn update(&mut self, next_renderer: Self) {
+        self.animate = next_renderer.animate;
+    }
 
     fn init(&mut self, cx: &mut GpuInitContext<'_>) {
         self.compute_program = Some(
@@ -187,7 +190,11 @@ impl GpuSurfaceRenderer for ClearSurfaceRenderer {
     }
 
     fn prepare(&mut self, frame: &nekowg::GpuFrameContext) {
-        self.time = frame.time.as_secs_f32();
+        self.time = if self.animate {
+            frame.time.as_secs_f32()
+        } else {
+            0.0
+        };
     }
 
     fn encode(&mut self, graph: &mut GpuGraphContext<'_>) {
@@ -244,7 +251,15 @@ impl GpuSurfaceRenderer for ClearSurfaceRenderer {
     }
 }
 
-struct GpuSurfaceClearDemo;
+struct GpuSurfaceClearDemo {
+    animate: bool,
+}
+
+impl GpuSurfaceClearDemo {
+    fn new(animate: bool) -> Self {
+        Self { animate }
+    }
+}
 
 impl Render for GpuSurfaceClearDemo {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
@@ -269,8 +284,13 @@ impl Render for GpuSurfaceClearDemo {
                             sampler: None,
                             extent: GpuExtent::default(),
                             time: 0.0,
+                            animate: self.animate,
                         })
-                        .redraw_mode(GpuSurfaceRedrawMode::Animated)
+                        .redraw_mode(if self.animate {
+                            GpuSurfaceRedrawMode::Animated
+                        } else {
+                            GpuSurfaceRedrawMode::OnDemand
+                        })
                         .size_full(),
                     ),
             )
@@ -285,7 +305,7 @@ fn run_example() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| GpuSurfaceClearDemo),
+            |_, cx| cx.new(|_| GpuSurfaceClearDemo::new(true)),
         )
         .unwrap();
         cx.activate(true);
@@ -294,6 +314,197 @@ fn run_example() {
 
 fn main() {
     let _ = env_logger::try_init();
+    #[cfg(all(target_os = "macos", feature = "test-support"))]
+    if std::env::var_os("NEKOWG_GPU_SURFACE_VISUAL_SMOKE").is_some() {
+        if let Err(err) = visual_smoke::run_suite() {
+            eprintln!("gpu_surface macOS visual smoke failed: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     run_example();
 }
 
+#[cfg(all(target_os = "macos", feature = "test-support"))]
+mod visual_smoke {
+    use super::*;
+    use anyhow::{Result, bail};
+    use image::RgbaImage;
+    use nekowg::{Modifiers, VisualTestAppContext, point};
+    use nekowg_platform::current_platform;
+
+    const WINDOW_WIDTH: f32 = 640.0;
+    const WINDOW_HEIGHT: f32 = 480.0;
+    const SURFACE_WIDTH: f32 = 480.0;
+    const SURFACE_HEIGHT: f32 = 320.0;
+    const SURFACE_LEFT: u32 = ((WINDOW_WIDTH - SURFACE_WIDTH) / 2.0) as u32;
+    const SURFACE_TOP: u32 = ((WINDOW_HEIGHT - SURFACE_HEIGHT) / 2.0) as u32;
+
+    fn open_demo_window(cx: &mut VisualTestAppContext) -> Result<nekowg::AnyWindowHandle> {
+        cx.open_offscreen_window(size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), |_, cx| {
+            cx.new(|_| GpuSurfaceClearDemo::new(false))
+        })
+        .map(Into::into)
+    }
+
+    fn close_demo_window(
+        cx: &mut VisualTestAppContext,
+        window: nekowg::AnyWindowHandle,
+    ) -> Result<()> {
+        cx.update_window(window, |_, window, _cx| {
+            window.remove_window();
+        })?;
+        cx.run_until_parked();
+        Ok(())
+    }
+
+    fn with_demo_window(
+        body: impl FnOnce(&mut VisualTestAppContext, nekowg::AnyWindowHandle) -> Result<()>,
+    ) -> Result<()> {
+        let mut cx = VisualTestAppContext::new(current_platform(false));
+        let window = open_demo_window(&mut cx)?;
+        cx.run_until_parked();
+
+        let result = body(&mut cx, window);
+        let close_result = close_demo_window(&mut cx, window);
+
+        match (result, close_result) {
+            (Err(err), Err(close_err)) => Err(err.context(format!(
+                "visual smoke cleanup failed after test error: {close_err:#}"
+            ))),
+            (Err(err), Ok(())) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn capture_current_frame(
+        cx: &mut VisualTestAppContext,
+        window: nekowg::AnyWindowHandle,
+    ) -> Result<RgbaImage> {
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear();
+        })?;
+        cx.capture_screenshot(window)
+    }
+
+    fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
+        image.get_pixel(x, y).0
+    }
+
+    fn color_distance(a: [u8; 4], b: [u8; 4]) -> u32 {
+        a.into_iter()
+            .zip(b)
+            .map(|(lhs, rhs)| lhs.abs_diff(rhs) as u32)
+            .sum()
+    }
+
+    fn average_patch(image: &RgbaImage, center_x: u32, center_y: u32, radius: u32) -> [u8; 4] {
+        let mut sum = [0u32; 4];
+        let mut count = 0u32;
+        for y in center_y - radius..=center_y + radius {
+            for x in center_x - radius..=center_x + radius {
+                let rgba = pixel(image, x, y);
+                for (channel, value) in sum.iter_mut().zip(rgba) {
+                    *channel += value as u32;
+                }
+                count += 1;
+            }
+        }
+        [
+            (sum[0] / count) as u8,
+            (sum[1] / count) as u8,
+            (sum[2] / count) as u8,
+            (sum[3] / count) as u8,
+        ]
+    }
+
+    fn smoke_renders_non_background_content() -> Result<()> {
+        with_demo_window(|cx, window| {
+            let screenshot = capture_current_frame(cx, window)?;
+
+            let background = pixel(&screenshot, 20, 20);
+            let center = average_patch(
+                &screenshot,
+                SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
+                SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
+                4,
+            );
+
+            if color_distance(background, center) <= 80 {
+                bail!(
+                    "expected gpu surface content to differ from the window background, background={background:?}, center={center:?}"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn smoke_respects_rounded_clip() -> Result<()> {
+        with_demo_window(|cx, window| {
+            let screenshot = capture_current_frame(cx, window)?;
+
+            let background = pixel(&screenshot, 20, 20);
+            let rounded_corner = average_patch(&screenshot, SURFACE_LEFT + 2, SURFACE_TOP + 2, 1);
+            let center = average_patch(
+                &screenshot,
+                SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
+                SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
+                4,
+            );
+
+            if color_distance(background, rounded_corner) >= 40 {
+                bail!(
+                    "expected rounded corner to remain clipped to background, background={background:?}, corner={rounded_corner:?}"
+                );
+            }
+            if color_distance(rounded_corner, center) <= 80 {
+                bail!(
+                    "expected clipped corner and interior content to differ, corner={rounded_corner:?}, center={center:?}"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn smoke_pointer_input_changes_output() -> Result<()> {
+        with_demo_window(|cx, window| {
+            let before = capture_current_frame(cx, window)?;
+            let before_center = average_patch(
+                &before,
+                SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
+                SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
+                6,
+            );
+
+            cx.simulate_mouse_move(
+                window,
+                point(px(WINDOW_WIDTH / 2.0), px(WINDOW_HEIGHT / 2.0)),
+                None,
+                Modifiers::default(),
+            );
+            let after = capture_current_frame(cx, window)?;
+            let after_center = average_patch(
+                &after,
+                SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
+                SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
+                6,
+            );
+
+            if color_distance(before_center, after_center) <= 40 {
+                bail!(
+                    "expected pointer input to change gpu surface output, before={before_center:?}, after={after_center:?}"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    pub fn run_suite() -> Result<()> {
+        smoke_renders_non_background_content()?;
+        smoke_respects_rounded_clip()?;
+        smoke_pointer_input_changes_output()?;
+        println!("gpu_surface macOS visual smoke passed");
+        Ok(())
+    }
+}

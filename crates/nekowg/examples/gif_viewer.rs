@@ -44,4 +44,3 @@ fn main() {
     env_logger::init();
     run_example();
 }
-

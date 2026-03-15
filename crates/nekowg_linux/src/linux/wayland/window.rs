@@ -34,9 +34,8 @@ use nekowg::{
     GpuSurfaceExecutionInput, Modifiers, PaintSurface, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
     RequestFrameOptions, ResizeEdge, Scene, Size, Tiling, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
-    WindowDecorations, WindowKind, WindowParams, layer_shell::LayerShellNotSupportedError, px,
-    size,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+    WindowKind, WindowParams, layer_shell::LayerShellNotSupportedError, px, size,
 };
 use nekowg_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 

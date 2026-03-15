@@ -37,7 +37,6 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     {
         nekowg_linux::current_platform(headless)
     }
-
 }
 
 #[cfg(all(test, target_os = "macos"))]

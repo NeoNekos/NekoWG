@@ -8,13 +8,13 @@ use nekowg::{
     GpuComputePassDesc, GpuComputeProgramDesc, GpuComputeProgramHandle, GpuDrawCall,
     GpuFrameContext, GpuGraphOperation, GpuRecordedGraph, GpuRenderPassDesc, GpuRenderProgramDesc,
     GpuRenderProgramHandle, GpuSamplerDesc, GpuSamplerHandle, GpuSpecs, GpuSurfaceExecutionInput,
-    GpuTextureDesc, GpuTextureFormat, GpuTextureHandle, Hsla, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
+    GpuTextureDesc, GpuTextureFormat, GpuTextureHandle, Hsla, MonochromeSprite, PaintSurface, Path,
+    Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
     SubpixelSprite, Underline, get_gamma_correction_ratios, point, px, size,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use std::collections::HashMap;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -274,7 +274,8 @@ impl WgpuGpuSurfaceState {
         device: &wgpu::Device,
         textures: &HashMap<GpuTextureHandle, GpuTextureDesc>,
     ) -> anyhow::Result<()> {
-        self.textures.retain(|handle, _| textures.contains_key(handle));
+        self.textures
+            .retain(|handle, _| textures.contains_key(handle));
         for (&handle, desc) in textures {
             let needs_recreate = self
                 .textures
@@ -293,7 +294,8 @@ impl WgpuGpuSurfaceState {
         device: &wgpu::Device,
         buffers: &HashMap<GpuBufferHandle, GpuBufferDesc>,
     ) -> anyhow::Result<()> {
-        self.buffers.retain(|handle, _| buffers.contains_key(handle));
+        self.buffers
+            .retain(|handle, _| buffers.contains_key(handle));
         for (&handle, desc) in buffers {
             let needs_recreate = self
                 .buffers
@@ -312,7 +314,8 @@ impl WgpuGpuSurfaceState {
         device: &wgpu::Device,
         samplers: &HashMap<GpuSamplerHandle, GpuSamplerDesc>,
     ) {
-        self.samplers.retain(|handle, _| samplers.contains_key(handle));
+        self.samplers
+            .retain(|handle, _| samplers.contains_key(handle));
         for (&handle, desc) in samplers {
             let needs_recreate = self
                 .samplers
@@ -354,7 +357,9 @@ impl WgpuGpuSurfaceState {
             if needs_recreate {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: desc.label.as_ref().map(|label| label.as_ref()),
-                    source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(desc.wgsl.as_ref())),
+                    source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                        desc.wgsl.as_ref(),
+                    )),
                 });
                 self.render_programs.insert(
                     handle,
@@ -383,7 +388,9 @@ impl WgpuGpuSurfaceState {
             if needs_recreate {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: desc.label.as_ref().map(|label| label.as_ref()),
-                    source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(desc.wgsl.as_ref())),
+                    source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                        desc.wgsl.as_ref(),
+                    )),
                 });
                 let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: desc.label.as_ref().map(|label| label.as_ref()),
@@ -482,10 +489,15 @@ impl WgpuGpuSurfaceState {
         }
 
         let pipeline = self
-            .render_pipeline(device, pass.program, gpu_texture_format_to_wgpu(target_desc.format))?
+            .render_pipeline(
+                device,
+                pass.program,
+                gpu_texture_format_to_wgpu(target_desc.format),
+            )?
             .clone();
         let bind_group_layout = pipeline.get_bind_group_layout(0);
-        let bind_group_entries = self.bind_group_entries(&self.frame_uniform_buffer, &pass.bindings)?;
+        let bind_group_entries =
+            self.bind_group_entries(&self.frame_uniform_buffer, &pass.bindings)?;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: pass.label.as_ref().map(|label| label.as_ref()),
             layout: &bind_group_layout,
@@ -554,7 +566,8 @@ impl WgpuGpuSurfaceState {
             .pipeline
             .clone();
         let bind_group_layout = pipeline.get_bind_group_layout(0);
-        let bind_group_entries = self.bind_group_entries(&self.frame_uniform_buffer, &pass.bindings)?;
+        let bind_group_entries =
+            self.bind_group_entries(&self.frame_uniform_buffer, &pass.bindings)?;
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: pass.label.as_ref().map(|label| label.as_ref()),
             layout: &bind_group_layout,
@@ -567,7 +580,11 @@ impl WgpuGpuSurfaceState {
         });
         compute_pass.set_pipeline(&pipeline);
         compute_pass.set_bind_group(0, &bind_group, &[]);
-        compute_pass.dispatch_workgroups(pass.workgroups[0], pass.workgroups[1], pass.workgroups[2]);
+        compute_pass.dispatch_workgroups(
+            pass.workgroups[0],
+            pass.workgroups[1],
+            pass.workgroups[2],
+        );
         Ok(())
     }
 
@@ -675,7 +692,8 @@ impl WgpuGpuSurfaceState {
             .render_programs
             .get_mut(&handle)
             .context("GpuSurface render program missing in WGPU state")?;
-        if let std::collections::hash_map::Entry::Vacant(entry) = program.pipelines.entry(target_format)
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            program.pipelines.entry(target_format)
         {
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: program.desc.label.as_ref().map(|label| label.as_ref()),

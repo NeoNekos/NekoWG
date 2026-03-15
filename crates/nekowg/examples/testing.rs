@@ -203,7 +203,6 @@ fn main() {
     run_example();
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

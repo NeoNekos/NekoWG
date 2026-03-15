@@ -1063,10 +1063,14 @@ mod tests {
             width: 64,
             height: 32,
         };
-        let first = runtime.prepare_frame(extent, crate::point(crate::px(4.0), crate::px(8.0)), None);
+        let first =
+            runtime.prepare_frame(extent, crate::point(crate::px(4.0), crate::px(8.0)), None);
         assert_eq!(first.frame_index, 0);
         assert_eq!(runtime.frame_index, 1);
-        assert_eq!(runtime.last_frame.as_ref().map(|frame| frame.extent), Some(extent));
+        assert_eq!(
+            runtime.last_frame.as_ref().map(|frame| frame.extent),
+            Some(extent)
+        );
 
         let second = runtime.prepare_frame(
             extent,

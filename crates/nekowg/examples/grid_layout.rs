@@ -82,4 +82,3 @@ fn run_example() {
 fn main() {
     run_example();
 }
-

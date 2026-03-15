@@ -10,7 +10,6 @@ fn main() {
     run_example();
 }
 
-
 #[cfg(all(target_os = "linux", feature = "wayland"))]
 mod example {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
