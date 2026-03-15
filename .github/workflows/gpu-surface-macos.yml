@@ -30,6 +30,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  NEKOWG_GPU_SURFACE_VISUAL_SMOKE: "1"
 
 jobs:
   macos-gpu-surface:
@@ -48,13 +49,9 @@ jobs:
         with:
           key: macos-gpu-surface-${{ hashFiles('Cargo.lock') }}
 
-      - name: step::run_gpu_surface_visual_tests
+      - name: step::run_gpu_surface_visual_smoke
         run: >
-          cargo test
+          cargo run
           -p nekowg
           --example gpu_surface
           --features test-support,nekowg_platform/test-support
-          --
-          --ignored
-          --test-threads=1
-          --nocapture

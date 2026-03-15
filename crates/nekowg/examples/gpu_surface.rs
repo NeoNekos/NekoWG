@@ -314,16 +314,23 @@ fn run_example() {
 
 fn main() {
     let _ = env_logger::try_init();
+    #[cfg(all(target_os = "macos", feature = "test-support"))]
+    if std::env::var_os("NEKOWG_GPU_SURFACE_VISUAL_SMOKE").is_some() {
+        if let Err(err) = visual_smoke::run_suite() {
+            eprintln!("gpu_surface macOS visual smoke failed: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     run_example();
 }
 
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
+#[cfg(all(target_os = "macos", feature = "test-support"))]
+mod visual_smoke {
     use super::*;
+    use anyhow::{bail, Result};
     use image::RgbaImage;
-    use nekowg::{
-        Modifiers, VisualTestAppContext, point,
-    };
+    use nekowg::{Modifiers, VisualTestAppContext, point};
     use nekowg_platform::current_platform;
 
     const WINDOW_WIDTH: f32 = 640.0;
@@ -333,7 +340,7 @@ mod tests {
     const SURFACE_LEFT: u32 = ((WINDOW_WIDTH - SURFACE_WIDTH) / 2.0) as u32;
     const SURFACE_TOP: u32 = ((WINDOW_HEIGHT - SURFACE_HEIGHT) / 2.0) as u32;
 
-    fn open_demo_window(cx: &mut VisualTestAppContext) -> nekowg::Result<nekowg::AnyWindowHandle> {
+    fn open_demo_window(cx: &mut VisualTestAppContext) -> Result<nekowg::AnyWindowHandle> {
         cx.open_offscreen_window(size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), |_, cx| {
             cx.new(|_| GpuSurfaceClearDemo::new(false))
         })
@@ -371,16 +378,12 @@ mod tests {
         ]
     }
 
-    #[test]
-    #[ignore = "Requires macOS main thread and off-screen rendering support"]
-    fn gpu_surface_visual_smoke_renders_non_background_content() {
+    fn smoke_renders_non_background_content() -> Result<()> {
         let mut cx = VisualTestAppContext::new(current_platform(false));
-        let window = open_demo_window(&mut cx).expect("opening the off-screen demo window");
+        let window = open_demo_window(&mut cx)?;
 
         cx.run_until_parked();
-        let screenshot = cx
-            .capture_screenshot(window)
-            .expect("capturing a gpu surface screenshot");
+        let screenshot = cx.capture_screenshot(window)?;
 
         let background = pixel(&screenshot, 20, 20);
         let center = average_patch(
@@ -390,22 +393,20 @@ mod tests {
             4,
         );
 
-        assert!(
-            color_distance(background, center) > 80,
-            "expected gpu surface content to differ from the window background, background={background:?}, center={center:?}"
-        );
+        if color_distance(background, center) <= 80 {
+            bail!(
+                "expected gpu surface content to differ from the window background, background={background:?}, center={center:?}"
+            );
+        }
+        Ok(())
     }
 
-    #[test]
-    #[ignore = "Requires macOS main thread and off-screen rendering support"]
-    fn gpu_surface_visual_smoke_respects_rounded_clip() {
+    fn smoke_respects_rounded_clip() -> Result<()> {
         let mut cx = VisualTestAppContext::new(current_platform(false));
-        let window = open_demo_window(&mut cx).expect("opening the off-screen demo window");
+        let window = open_demo_window(&mut cx)?;
 
         cx.run_until_parked();
-        let screenshot = cx
-            .capture_screenshot(window)
-            .expect("capturing a gpu surface screenshot");
+        let screenshot = cx.capture_screenshot(window)?;
 
         let background = pixel(&screenshot, 20, 20);
         let rounded_corner = average_patch(&screenshot, SURFACE_LEFT + 2, SURFACE_TOP + 2, 1);
@@ -416,26 +417,25 @@ mod tests {
             4,
         );
 
-        assert!(
-            color_distance(background, rounded_corner) < 40,
-            "expected rounded corner to remain clipped to background, background={background:?}, corner={rounded_corner:?}"
-        );
-        assert!(
-            color_distance(rounded_corner, center) > 80,
-            "expected clipped corner and interior content to differ, corner={rounded_corner:?}, center={center:?}"
-        );
+        if color_distance(background, rounded_corner) >= 40 {
+            bail!(
+                "expected rounded corner to remain clipped to background, background={background:?}, corner={rounded_corner:?}"
+            );
+        }
+        if color_distance(rounded_corner, center) <= 80 {
+            bail!(
+                "expected clipped corner and interior content to differ, corner={rounded_corner:?}, center={center:?}"
+            );
+        }
+        Ok(())
     }
 
-    #[test]
-    #[ignore = "Requires macOS main thread and off-screen rendering support"]
-    fn gpu_surface_visual_smoke_pointer_input_changes_output() {
+    fn smoke_pointer_input_changes_output() -> Result<()> {
         let mut cx = VisualTestAppContext::new(current_platform(false));
-        let window = open_demo_window(&mut cx).expect("opening the off-screen demo window");
+        let window = open_demo_window(&mut cx)?;
 
         cx.run_until_parked();
-        let before = cx
-            .capture_screenshot(window)
-            .expect("capturing pre-input screenshot");
+        let before = cx.capture_screenshot(window)?;
         let before_center = average_patch(
             &before,
             SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
@@ -449,9 +449,7 @@ mod tests {
             None,
             Modifiers::default(),
         );
-        let after = cx
-            .capture_screenshot(window)
-            .expect("capturing post-input screenshot");
+        let after = cx.capture_screenshot(window)?;
         let after_center = average_patch(
             &after,
             SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
@@ -459,10 +457,20 @@ mod tests {
             6,
         );
 
-        assert!(
-            color_distance(before_center, after_center) > 40,
-            "expected pointer input to change gpu surface output, before={before_center:?}, after={after_center:?}"
-        );
+        if color_distance(before_center, after_center) <= 40 {
+            bail!(
+                "expected pointer input to change gpu surface output, before={before_center:?}, after={after_center:?}"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn run_suite() -> Result<()> {
+        smoke_renders_non_background_content()?;
+        smoke_respects_rounded_clip()?;
+        smoke_pointer_input_changes_output()?;
+        println!("gpu_surface macOS visual smoke passed");
+        Ok(())
     }
 }
 
