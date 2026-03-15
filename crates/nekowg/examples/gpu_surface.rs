@@ -117,10 +117,13 @@ struct ClearSurfaceRenderer {
     sampler: Option<GpuSamplerHandle>,
     extent: GpuExtent,
     time: f32,
+    animate: bool,
 }
 
 impl GpuSurfaceRenderer for ClearSurfaceRenderer {
-    fn update(&mut self, _next_renderer: Self) {}
+    fn update(&mut self, next_renderer: Self) {
+        self.animate = next_renderer.animate;
+    }
 
     fn init(&mut self, cx: &mut GpuInitContext<'_>) {
         self.compute_program = Some(
@@ -187,7 +190,11 @@ impl GpuSurfaceRenderer for ClearSurfaceRenderer {
     }
 
     fn prepare(&mut self, frame: &nekowg::GpuFrameContext) {
-        self.time = frame.time.as_secs_f32();
+        self.time = if self.animate {
+            frame.time.as_secs_f32()
+        } else {
+            0.0
+        };
     }
 
     fn encode(&mut self, graph: &mut GpuGraphContext<'_>) {
@@ -244,7 +251,15 @@ impl GpuSurfaceRenderer for ClearSurfaceRenderer {
     }
 }
 
-struct GpuSurfaceClearDemo;
+struct GpuSurfaceClearDemo {
+    animate: bool,
+}
+
+impl GpuSurfaceClearDemo {
+    fn new(animate: bool) -> Self {
+        Self { animate }
+    }
+}
 
 impl Render for GpuSurfaceClearDemo {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
@@ -269,8 +284,13 @@ impl Render for GpuSurfaceClearDemo {
                             sampler: None,
                             extent: GpuExtent::default(),
                             time: 0.0,
+                            animate: self.animate,
                         })
-                        .redraw_mode(GpuSurfaceRedrawMode::Animated)
+                        .redraw_mode(if self.animate {
+                            GpuSurfaceRedrawMode::Animated
+                        } else {
+                            GpuSurfaceRedrawMode::OnDemand
+                        })
                         .size_full(),
                     ),
             )
@@ -285,7 +305,7 @@ fn run_example() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|_| GpuSurfaceClearDemo),
+            |_, cx| cx.new(|_| GpuSurfaceClearDemo::new(true)),
         )
         .unwrap();
         cx.activate(true);
@@ -295,5 +315,154 @@ fn run_example() {
 fn main() {
     let _ = env_logger::try_init();
     run_example();
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use image::RgbaImage;
+    use nekowg::{
+        Modifiers, VisualTestAppContext, point,
+    };
+    use nekowg_platform::current_platform;
+
+    const WINDOW_WIDTH: f32 = 640.0;
+    const WINDOW_HEIGHT: f32 = 480.0;
+    const SURFACE_WIDTH: f32 = 480.0;
+    const SURFACE_HEIGHT: f32 = 320.0;
+    const SURFACE_LEFT: u32 = ((WINDOW_WIDTH - SURFACE_WIDTH) / 2.0) as u32;
+    const SURFACE_TOP: u32 = ((WINDOW_HEIGHT - SURFACE_HEIGHT) / 2.0) as u32;
+
+    fn open_demo_window(cx: &mut VisualTestAppContext) -> nekowg::Result<nekowg::AnyWindowHandle> {
+        cx.open_offscreen_window(size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), |_, cx| {
+            cx.new(|_| GpuSurfaceClearDemo::new(false))
+        })
+        .map(Into::into)
+    }
+
+    fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
+        image.get_pixel(x, y).0
+    }
+
+    fn color_distance(a: [u8; 4], b: [u8; 4]) -> u32 {
+        a.into_iter()
+            .zip(b)
+            .map(|(lhs, rhs)| lhs.abs_diff(rhs) as u32)
+            .sum()
+    }
+
+    fn average_patch(image: &RgbaImage, center_x: u32, center_y: u32, radius: u32) -> [u8; 4] {
+        let mut sum = [0u32; 4];
+        let mut count = 0u32;
+        for y in center_y - radius..=center_y + radius {
+            for x in center_x - radius..=center_x + radius {
+                let rgba = pixel(image, x, y);
+                for (channel, value) in sum.iter_mut().zip(rgba) {
+                    *channel += value as u32;
+                }
+                count += 1;
+            }
+        }
+        [
+            (sum[0] / count) as u8,
+            (sum[1] / count) as u8,
+            (sum[2] / count) as u8,
+            (sum[3] / count) as u8,
+        ]
+    }
+
+    #[test]
+    #[ignore = "Requires macOS main thread and off-screen rendering support"]
+    fn gpu_surface_visual_smoke_renders_non_background_content() {
+        let mut cx = VisualTestAppContext::new(current_platform(false));
+        let window = open_demo_window(&mut cx).expect("opening the off-screen demo window");
+
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window)
+            .expect("capturing a gpu surface screenshot");
+
+        let background = pixel(&screenshot, 20, 20);
+        let center = average_patch(
+            &screenshot,
+            SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
+            SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
+            4,
+        );
+
+        assert!(
+            color_distance(background, center) > 80,
+            "expected gpu surface content to differ from the window background, background={background:?}, center={center:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "Requires macOS main thread and off-screen rendering support"]
+    fn gpu_surface_visual_smoke_respects_rounded_clip() {
+        let mut cx = VisualTestAppContext::new(current_platform(false));
+        let window = open_demo_window(&mut cx).expect("opening the off-screen demo window");
+
+        cx.run_until_parked();
+        let screenshot = cx
+            .capture_screenshot(window)
+            .expect("capturing a gpu surface screenshot");
+
+        let background = pixel(&screenshot, 20, 20);
+        let rounded_corner = average_patch(&screenshot, SURFACE_LEFT + 2, SURFACE_TOP + 2, 1);
+        let center = average_patch(
+            &screenshot,
+            SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
+            SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
+            4,
+        );
+
+        assert!(
+            color_distance(background, rounded_corner) < 40,
+            "expected rounded corner to remain clipped to background, background={background:?}, corner={rounded_corner:?}"
+        );
+        assert!(
+            color_distance(rounded_corner, center) > 80,
+            "expected clipped corner and interior content to differ, corner={rounded_corner:?}, center={center:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "Requires macOS main thread and off-screen rendering support"]
+    fn gpu_surface_visual_smoke_pointer_input_changes_output() {
+        let mut cx = VisualTestAppContext::new(current_platform(false));
+        let window = open_demo_window(&mut cx).expect("opening the off-screen demo window");
+
+        cx.run_until_parked();
+        let before = cx
+            .capture_screenshot(window)
+            .expect("capturing pre-input screenshot");
+        let before_center = average_patch(
+            &before,
+            SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
+            SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
+            6,
+        );
+
+        cx.simulate_mouse_move(
+            window,
+            point(px(WINDOW_WIDTH / 2.0), px(WINDOW_HEIGHT / 2.0)),
+            None,
+            Modifiers::default(),
+        );
+        let after = cx
+            .capture_screenshot(window)
+            .expect("capturing post-input screenshot");
+        let after_center = average_patch(
+            &after,
+            SURFACE_LEFT + (SURFACE_WIDTH as u32 / 2),
+            SURFACE_TOP + (SURFACE_HEIGHT as u32 / 2),
+            6,
+        );
+
+        assert!(
+            color_distance(before_center, after_center) > 40,
+            "expected pointer input to change gpu surface output, before={before_center:?}, after={after_center:?}"
+        );
+    }
 }
 

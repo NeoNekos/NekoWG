@@ -1,0 +1,60 @@
+name: gpu surface macos smoke
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/gpu-surface-macos.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/nekowg/Cargo.toml"
+      - "crates/nekowg/examples/gpu_surface.rs"
+      - "crates/nekowg/src/**"
+      - "crates/nekowg_macos/Cargo.toml"
+      - "crates/nekowg_macos/src/**"
+      - "crates/nekowg_platform/Cargo.toml"
+      - "crates/nekowg_platform/src/**"
+  pull_request:
+    paths:
+      - ".github/workflows/gpu-surface-macos.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/nekowg/Cargo.toml"
+      - "crates/nekowg/examples/gpu_surface.rs"
+      - "crates/nekowg/src/**"
+      - "crates/nekowg_macos/Cargo.toml"
+      - "crates/nekowg_macos/src/**"
+      - "crates/nekowg_platform/Cargo.toml"
+      - "crates/nekowg_platform/src/**"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  macos-gpu-surface:
+    name: macos gpu surface smoke
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.93
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-gpu-surface-${{ hashFiles('Cargo.lock') }}
+
+      - name: step::run_gpu_surface_visual_tests
+        run: >
+          cargo test
+          -p nekowg
+          --example gpu_surface
+          --features test-support,nekowg_platform/test-support
+          --
+          --ignored
+          --test-threads=1
+          --nocapture
