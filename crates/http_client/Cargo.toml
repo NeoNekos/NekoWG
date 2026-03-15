@@ -29,6 +29,4 @@ serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded.workspace = true
 url.workspace = true
-
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
 util.workspace = true

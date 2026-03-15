@@ -1,6 +1,4 @@
-#[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
-#[cfg(not(target_family = "wasm"))]
 use nekowg_util::ResultExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +19,6 @@ pub struct CompositorGpuHint {
 }
 
 impl WgpuContext {
-    #[cfg(not(target_family = "wasm"))]
     pub fn new(
         instance: wgpu::Instance,
         surface: &wgpu::Surface<'_>,
@@ -76,43 +73,6 @@ impl WgpuContext {
         })
     }
 
-    #[cfg(target_family = "wasm")]
-    pub async fn new_web() -> anyhow::Result<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
-            flags: wgpu::InstanceFlags::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-        });
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to request GPU adapter: {e}"))?;
-
-        log::info!(
-            "Selected GPU adapter: {:?} ({:?})",
-            adapter.get_info().name,
-            adapter.get_info().backend
-        );
-
-        let device_lost = Arc::new(AtomicBool::new(false));
-        let (device, queue, dual_source_blending) = Self::create_device(&adapter).await?;
-
-        Ok(Self {
-            instance,
-            adapter,
-            device: Arc::new(device),
-            queue: Arc::new(queue),
-            dual_source_blending,
-            device_lost,
-        })
-    }
-
     async fn create_device(
         adapter: &wgpu::Adapter,
     ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool)> {
@@ -147,7 +107,6 @@ impl WgpuContext {
         Ok((device, queue, dual_source_blending))
     }
 
-    #[cfg(not(target_family = "wasm"))]
     pub fn instance() -> wgpu::Instance {
         wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
@@ -177,7 +136,6 @@ impl WgpuContext {
     /// adapters may report surface compatibility via get_capabilities() but fail when actually
     /// configuring (e.g., NVIDIA reporting Vulkan Wayland support but failing because the
     /// Wayland compositor runs on the Intel GPU).
-    #[cfg(not(target_family = "wasm"))]
     async fn select_adapter_and_device(
         instance: &wgpu::Instance,
         device_id_filter: Option<u32>,
@@ -292,7 +250,6 @@ impl WgpuContext {
 
     /// Try to use an adapter with a surface by creating a device and testing configuration.
     /// Returns the device and queue if successful, allowing them to be reused.
-    #[cfg(not(target_family = "wasm"))]
     async fn try_adapter_with_surface(
         adapter: &wgpu::Adapter,
         surface: &wgpu::Surface<'_>,
@@ -349,7 +306,6 @@ impl WgpuContext {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
     let mut id = id.trim();
 

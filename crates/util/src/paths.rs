@@ -54,13 +54,6 @@ pub trait PathExt {
     where
         Self: From<&'a Path>,
     {
-        #[cfg(target_family = "wasm")]
-        {
-            std::str::from_utf8(bytes)
-                .map(Path::new)
-                .map(Into::into)
-                .map_err(Into::into)
-        }
         #[cfg(unix)]
         {
             use std::os::unix::prelude::OsStrExt;
@@ -92,17 +85,11 @@ pub trait PathExt {
     fn multiple_extensions(&self) -> Option<String>;
 
     /// Try to make a shell-safe representation of the path.
-    #[cfg(not(target_family = "wasm"))]
     fn try_shell_safe(&self, shell_kind: crate::shell::ShellKind) -> anyhow::Result<String>;
 }
 
 impl<T: AsRef<Path>> PathExt for T {
     fn compact(&self) -> PathBuf {
-        #[cfg(target_family = "wasm")]
-        {
-            self.as_ref().to_path_buf()
-        }
-        #[cfg(not(target_family = "wasm"))]
         if cfg!(any(target_os = "linux", target_os = "freebsd")) || cfg!(target_os = "macos") {
             match self.as_ref().strip_prefix(home_dir().as_path()) {
                 Ok(relative_path) => {
@@ -176,7 +163,6 @@ impl<T: AsRef<Path>> PathExt for T {
         Some(parts.into_iter().join("."))
     }
 
-    #[cfg(not(target_family = "wasm"))]
     fn try_shell_safe(&self, shell_kind: crate::shell::ShellKind) -> anyhow::Result<String> {
         use anyhow::Context;
         let path_str = self

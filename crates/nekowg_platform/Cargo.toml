@@ -32,6 +32,3 @@ nekowg_windows.workspace = true
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 nekowg_linux.workspace = true
 
-[target.'cfg(target_family = "wasm")'.dependencies]
-nekowg_web.workspace = true
-console_error_panic_hook = "0.1.7"

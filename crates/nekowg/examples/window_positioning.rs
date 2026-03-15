@@ -1,5 +1,3 @@
-#![cfg_attr(target_family = "wasm", no_main)]
-
 use nekowg::{
     App, Bounds, Context, DisplayId, Hsla, Pixels, SharedString, Size, Window,
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, prelude::*,
@@ -221,14 +219,7 @@ fn run_example() {
     });
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn main() {
     run_example();
 }
 
-#[cfg(target_family = "wasm")]
-#[wasm_bindgen::prelude::wasm_bindgen(start)]
-pub fn start() {
-    nekowg_platform::web_init();
-    run_example();
-}

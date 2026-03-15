@@ -1,5 +1,3 @@
-#![cfg_attr(target_family = "wasm", no_main)]
-
 use std::{path::Path, sync::Arc, time::Duration};
 
 use nekowg::{
@@ -212,15 +210,8 @@ fn run_example() {
     });
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn main() {
     env_logger::init();
     run_example();
 }
 
-#[cfg(target_family = "wasm")]
-#[wasm_bindgen::prelude::wasm_bindgen(start)]
-pub fn start() {
-    nekowg_platform::web_init();
-    run_example();
-}

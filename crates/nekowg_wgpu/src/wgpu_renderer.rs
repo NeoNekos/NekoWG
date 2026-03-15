@@ -12,7 +12,6 @@ use nekowg::{
     Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
     SubpixelSprite, Underline, get_gamma_correction_ratios, point, px, size,
 };
-#[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::collections::HashMap;
 use std::cell::RefCell;
@@ -735,10 +734,10 @@ impl WgpuGpuSurfaceState {
 }
 
 pub struct WgpuRenderer {
-    /// Shared GPU context for device recovery coordination (unused on WASM).
+    /// Shared GPU context for device recovery coordination
     #[allow(dead_code)]
     context: Option<GpuContext>,
-    /// Compositor GPU hint for adapter selection (unused on WASM).
+    /// Compositor GPU hint for adapter selection
     #[allow(dead_code)]
     compositor_gpu: Option<CompositorGpuHint>,
     resources: Option<WgpuResources>,
@@ -784,7 +783,6 @@ impl WgpuRenderer {
     /// # Safety
     /// The caller must ensure that the window handle remains valid for the lifetime
     /// of the returned renderer.
-    #[cfg(not(target_family = "wasm"))]
     pub fn new<W: HasWindowHandle + HasDisplayHandle>(
         gpu_context: GpuContext,
         window: &W,
@@ -843,25 +841,6 @@ impl WgpuRenderer {
             compositor_gpu,
             atlas,
         )
-    }
-
-    #[cfg(target_family = "wasm")]
-    pub fn new_from_canvas(
-        context: &WgpuContext,
-        canvas: &web_sys::HtmlCanvasElement,
-        config: WgpuSurfaceConfig,
-    ) -> anyhow::Result<Self> {
-        let surface = context
-            .instance
-            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
-            .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?;
-
-        let atlas = Arc::new(WgpuAtlas::new(
-            Arc::clone(&context.device),
-            Arc::clone(&context.queue),
-        ));
-
-        Self::new_internal(None, context, surface, config, None, atlas)
     }
 
     fn new_internal(
@@ -3052,7 +3031,6 @@ impl WgpuRenderer {
     /// This method coordinates recovery across multiple windows:
     /// - The first window to call this will recreate the shared context
     /// - Subsequent windows will adopt the already-recovered context
-    #[cfg(not(target_family = "wasm"))]
     pub fn recover(
         &mut self,
         raw_display_handle: raw_window_handle::RawDisplayHandle,
@@ -3234,7 +3212,6 @@ fn gpu_clear_color_to_wgpu(clear: GpuClearColor) -> wgpu::Color {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn create_surface(
     instance: &wgpu::Instance,
     raw_display_handle: raw_window_handle::RawDisplayHandle,

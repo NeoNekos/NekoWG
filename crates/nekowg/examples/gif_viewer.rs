@@ -1,5 +1,3 @@
-#![cfg_attr(target_family = "wasm", no_main)]
-
 use nekowg::{App, Context, Render, Window, WindowOptions, div, img, prelude::*};
 use nekowg_platform::application;
 use std::path::PathBuf;
@@ -42,15 +40,8 @@ fn run_example() {
     });
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn main() {
     env_logger::init();
     run_example();
 }
 
-#[cfg(target_family = "wasm")]
-#[wasm_bindgen::prelude::wasm_bindgen(start)]
-pub fn start() {
-    nekowg_platform::web_init();
-    run_example();
-}

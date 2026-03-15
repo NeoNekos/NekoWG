@@ -43,7 +43,6 @@ fn write_tree(path: &Path, tree: serde_json::Value) {
                 Value::Object(_) => {
                     fs::create_dir(&path).unwrap();
 
-                    #[cfg(not(target_family = "wasm"))]
                     if path.file_name() == Some(OsStr::new(".git")) {
                         git2::Repository::init(path.parent().unwrap()).unwrap();
                     }
