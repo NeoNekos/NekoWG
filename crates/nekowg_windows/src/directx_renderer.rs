@@ -138,6 +138,8 @@ struct DirectXGpuSurfaceState {
     render_programs: HashMap<GpuRenderProgramHandle, DirectXGpuSurfaceRenderProgram>,
     compute_programs: HashMap<GpuComputeProgramHandle, DirectXGpuSurfaceComputeProgram>,
     frame_uniform_buffer: ID3D11Buffer,
+    render_blend_state: ID3D11BlendState,
+    rasterizer_state: ID3D11RasterizerState,
     last_used_frame: u64,
 }
 
@@ -272,6 +274,8 @@ impl DirectXGpuSurfaceState {
                 device,
                 std::mem::size_of::<GpuSurfaceFrameUniform>(),
             )?,
+            render_blend_state: create_blend_state_no_blend(device)?,
+            rasterizer_state: create_gpu_surface_rasterizer_state(device)?,
             last_used_frame: 0,
         })
     }
@@ -529,6 +533,7 @@ impl DirectXGpuSurfaceState {
         let frame_uniform_buffer = [Some(self.frame_uniform_buffer.clone())];
         let mut extra_constant_buffers = Vec::new();
         let mut extra_shader_resources = Vec::new();
+        let mut extra_unordered_access_views = Vec::new();
         let mut extra_samplers = Vec::new();
         for (binding, layout) in pass.bindings.iter().zip(program.bindings.iter()) {
             match (binding, layout.kind) {
@@ -546,6 +551,40 @@ impl DirectXGpuSurfaceState {
                     extra_constant_buffers.push((layout.slot, buffer.buffer.clone()));
                 }
                 (
+                    GpuBinding::StorageBuffer(handle),
+                    DirectXGpuSurfaceProgramBindingKind::StorageBufferReadOnly,
+                ) => {
+                    let buffer = self
+                        .buffers
+                        .get(handle)
+                        .context("GpuSurface storage buffer binding missing in DX11 state")?;
+                    if buffer.desc.usage != GpuBufferUsage::Storage {
+                        anyhow::bail!("GpuSurface storage binding points to a non-storage buffer");
+                    }
+                    let view = buffer
+                        .shader_resource_view
+                        .clone()
+                        .context("GpuSurface storage buffer is not readable on DX11")?;
+                    extra_shader_resources.push((layout.slot, view));
+                }
+                (
+                    GpuBinding::StorageBuffer(handle),
+                    DirectXGpuSurfaceProgramBindingKind::StorageBufferReadWrite,
+                ) => {
+                    let buffer = self
+                        .buffers
+                        .get(handle)
+                        .context("GpuSurface storage buffer binding missing in DX11 state")?;
+                    if buffer.desc.usage != GpuBufferUsage::Storage {
+                        anyhow::bail!("GpuSurface storage binding points to a non-storage buffer");
+                    }
+                    let view = buffer
+                        .unordered_access_view
+                        .clone()
+                        .context("GpuSurface storage buffer is not writable on DX11")?;
+                    extra_unordered_access_views.push((layout.slot, view));
+                }
+                (
                     GpuBinding::SampledTexture(handle),
                     DirectXGpuSurfaceProgramBindingKind::SampledTexture,
                 ) => {
@@ -558,6 +597,19 @@ impl DirectXGpuSurfaceState {
                         .context("GpuSurface sampled texture is not sampleable on DX11")?;
                     extra_shader_resources.push((layout.slot, view));
                 }
+                (
+                    GpuBinding::StorageTexture(handle),
+                    DirectXGpuSurfaceProgramBindingKind::StorageTexture,
+                ) => {
+                    let view = self
+                        .textures
+                        .get(handle)
+                        .context("GpuSurface storage texture binding missing in DX11 state")?
+                        .unordered_access_view
+                        .clone()
+                        .context("GpuSurface storage texture is not writable on DX11")?;
+                    extra_unordered_access_views.push((layout.slot, view));
+                }
                 (GpuBinding::Sampler(handle), DirectXGpuSurfaceProgramBindingKind::Sampler) => {
                     let sampler = self
                         .samplers
@@ -567,42 +619,48 @@ impl DirectXGpuSurfaceState {
                         .clone();
                     extra_samplers.push((layout.slot, sampler));
                 }
-                (
-                    GpuBinding::StorageBuffer(_),
-                    DirectXGpuSurfaceProgramBindingKind::StorageBufferReadOnly,
-                )
-                | (
-                    GpuBinding::StorageBuffer(_),
-                    DirectXGpuSurfaceProgramBindingKind::StorageBufferReadWrite,
-                )
-                | (
-                    GpuBinding::StorageTexture(_),
-                    DirectXGpuSurfaceProgramBindingKind::StorageTexture,
-                ) => {
-                    anyhow::bail!("GpuSurface DX11 executor does not support storage bindings yet");
-                }
                 _ => {
                     anyhow::bail!("GpuSurface render pass binding type does not match shader");
                 }
             }
         }
-        let vertex_count = match pass.draw {
-            GpuDrawCall::FullScreenTriangle => 3,
-            GpuDrawCall::Triangles { .. } => {
-                anyhow::bail!(
-                    "GpuSurface DX11 executor supports only FullScreenTriangle draws for now"
-                );
-            }
+        let (vertex_count, instance_count) = match pass.draw {
+            GpuDrawCall::FullScreenTriangle => (3, 1),
+            GpuDrawCall::Triangles {
+                vertex_count,
+                instance_count,
+            } => (vertex_count, instance_count),
         };
         unsafe {
-            device_context.OMSetRenderTargets(Some(&render_target), None);
+            if let Some(max_slot) = extra_unordered_access_views
+                .iter()
+                .map(|(slot, _)| *slot)
+                .max()
+            {
+                let mut unordered_access_views = vec![None; max_slot as usize + 1];
+                for (slot, view) in &extra_unordered_access_views {
+                    unordered_access_views[*slot as usize] = Some(view.clone());
+                }
+                device_context.OMSetRenderTargetsAndUnorderedAccessViews(
+                    Some(&render_target),
+                    None,
+                    0,
+                    unordered_access_views.len() as u32,
+                    Some(unordered_access_views.as_ptr()),
+                    None,
+                );
+            } else {
+                device_context.OMSetRenderTargets(Some(&render_target), None);
+            }
             device_context.RSSetViewports(Some(std::slice::from_ref(&viewport)));
             device_context.RSSetScissorRects(Some(std::slice::from_ref(&scissor)));
+            device_context.RSSetState(&self.rasterizer_state);
             device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             device_context.VSSetShader(&program.vertex, None);
             device_context.PSSetShader(&program.fragment, None);
             device_context.VSSetConstantBuffers(0, Some(&frame_uniform_buffer));
             device_context.PSSetConstantBuffers(0, Some(&frame_uniform_buffer));
+            device_context.OMSetBlendState(&self.render_blend_state, None, 0xFFFFFFFF);
             for (slot, buffer) in &extra_constant_buffers {
                 let constant_buffer = [Some(buffer.clone())];
                 device_context.VSSetConstantBuffers(*slot, Some(&constant_buffer));
@@ -618,11 +676,26 @@ impl DirectXGpuSurfaceState {
                 device_context.VSSetSamplers(*slot, Some(&sampler_state));
                 device_context.PSSetSamplers(*slot, Some(&sampler_state));
             }
-            device_context.Draw(vertex_count, 0);
+            device_context.DrawInstanced(vertex_count, instance_count, 0, 0);
 
             let empty_constant_buffer: [Option<ID3D11Buffer>; 1] = [None];
             let empty_shader_resource: [Option<ID3D11ShaderResourceView>; 1] = [None];
             let empty_sampler: [Option<ID3D11SamplerState>; 1] = [None];
+            if let Some(max_slot) = extra_unordered_access_views
+                .iter()
+                .map(|(slot, _)| *slot)
+                .max()
+            {
+                let empty_unordered_access_views = vec![None; max_slot as usize + 1];
+                device_context.OMSetRenderTargetsAndUnorderedAccessViews(
+                    Some(&render_target),
+                    None,
+                    0,
+                    empty_unordered_access_views.len() as u32,
+                    Some(empty_unordered_access_views.as_ptr()),
+                    None,
+                );
+            }
             for (slot, _) in &extra_constant_buffers {
                 device_context.VSSetConstantBuffers(*slot, Some(&empty_constant_buffer));
                 device_context.PSSetConstantBuffers(*slot, Some(&empty_constant_buffer));
@@ -2990,7 +3063,6 @@ fn create_gpu_surface_render_program(
 ) -> Result<DirectXGpuSurfaceRenderProgram> {
     let module =
         naga::front::wgsl::parse_str(desc.wgsl.as_ref()).context("Parsing GpuSurface WGSL")?;
-    let bindings = gpu_surface_program_bindings(&module)?;
     let mut validator = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::all(),
@@ -3000,6 +3072,8 @@ fn create_gpu_surface_render_program(
     let module_info = validator
         .validate(&module)
         .context("Validating GpuSurface WGSL module")?;
+    validate_gpu_surface_render_program_stages(&module, &module_info, desc)?;
+    let bindings = gpu_surface_program_bindings(&module)?;
     let sampler_bindings = gpu_surface_hlsl_sampler_bindings(&module)?;
     let vertex_hlsl = build_gpu_surface_hlsl_source(
         &module,
@@ -3038,6 +3112,72 @@ fn create_gpu_surface_render_program(
         fragment,
         bindings,
     })
+}
+
+fn validate_gpu_surface_render_program_stages(
+    module: &naga::Module,
+    module_info: &naga::valid::ModuleInfo,
+    desc: &GpuRenderProgramDesc,
+) -> Result<()> {
+    let vertex_entry_index = gpu_surface_entry_point_index(
+        module,
+        naga::ShaderStage::Vertex,
+        desc.vertex_entry.as_ref(),
+    )?;
+    let _fragment_entry_index = gpu_surface_entry_point_index(
+        module,
+        naga::ShaderStage::Fragment,
+        desc.fragment_entry.as_ref(),
+    )?;
+    let vertex_info = module_info.get_entry_point(vertex_entry_index);
+
+    for (handle, variable) in module.global_variables.iter() {
+        let Some(binding) = variable.binding else {
+            continue;
+        };
+        if binding.group != 0 {
+            anyhow::bail!("GpuSurface DX11 supports only @group(0) bindings");
+        }
+        if binding.binding == 0 {
+            continue;
+        }
+
+        let usage = vertex_info[handle];
+        if usage.is_empty() {
+            continue;
+        }
+
+        match gpu_surface_binding_kind(module, variable)? {
+            DirectXGpuSurfaceProgramBindingKind::StorageBufferReadWrite => anyhow::bail!(
+                "GpuSurface DX11 render program does not support vertex-stage writable storage buffers at @group(0) @binding({})",
+                binding.binding
+            ),
+            DirectXGpuSurfaceProgramBindingKind::StorageTexture => anyhow::bail!(
+                "GpuSurface DX11 render program does not support vertex-stage storage textures at @group(0) @binding({})",
+                binding.binding
+            ),
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn gpu_surface_entry_point_index(
+    module: &naga::Module,
+    stage: naga::ShaderStage,
+    entry_point: &str,
+) -> Result<usize> {
+    module
+        .entry_points
+        .iter()
+        .position(|candidate| candidate.stage == stage && candidate.name == entry_point)
+        .with_context(|| {
+            format!(
+                "GpuSurface DX11 could not find {:?} entry point `{}` in WGSL module",
+                stage, entry_point
+            )
+        })
 }
 
 fn create_gpu_surface_compute_program(
@@ -3643,6 +3783,26 @@ fn create_blend_state_for_path_sprite(device: &ID3D11Device) -> Result<ID3D11Ble
     }
 }
 
+fn create_gpu_surface_rasterizer_state(device: &ID3D11Device) -> Result<ID3D11RasterizerState> {
+    let desc = D3D11_RASTERIZER_DESC {
+        FillMode: D3D11_FILL_SOLID,
+        CullMode: D3D11_CULL_NONE,
+        FrontCounterClockwise: false.into(),
+        DepthBias: 0,
+        DepthBiasClamp: 0.0,
+        SlopeScaledDepthBias: 0.0,
+        DepthClipEnable: true.into(),
+        ScissorEnable: true.into(),
+        MultisampleEnable: false.into(),
+        AntialiasedLineEnable: false.into(),
+    };
+    unsafe {
+        let mut state = None;
+        device.CreateRasterizerState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
 #[inline]
 fn create_vertex_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11VertexShader> {
     unsafe {
@@ -3745,7 +3905,7 @@ mod tests {
     use super::{
         DirectXGpuSurfaceProgramBinding, DirectXGpuSurfaceProgramBindingKind,
         DirectXGpuSurfaceTexturePool, GpuSurfaceHlslSamplerBinding,
-        rewrite_gpu_surface_hlsl_sampler_bindings,
+        rewrite_gpu_surface_hlsl_sampler_bindings, validate_gpu_surface_render_program_stages,
     };
     use nekowg::{GpuExtent, GpuTextureDesc, GpuTextureFormat};
 
@@ -3949,6 +4109,161 @@ fn cs_main() {}
                 },
             ]
         );
+    }
+
+    #[test]
+    fn rejects_vertex_stage_writable_storage_buffer_in_render_program() {
+        let wgsl = r#"
+struct GpuSurfaceFrame {
+    metrics: vec4<f32>,
+    extent_cursor: vec4<f32>,
+    surface_cursor: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> frame: GpuSurfaceFrame;
+
+@group(0) @binding(1)
+var<storage, read_write> values: array<u32>;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    values[0] = vertex_index;
+    return VertexOutput(vec4<f32>(0.0, 0.0, 0.0, 1.0));
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+}
+"#;
+        let module = naga::front::wgsl::parse_str(wgsl).expect("WGSL should parse");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator.subgroup_stages(naga::valid::ShaderStages::all());
+        validator.subgroup_operations(naga::valid::SubgroupOperationSet::all());
+        let module_info = validator.validate(&module).expect("WGSL should validate");
+        let desc = nekowg::GpuRenderProgramDesc {
+            label: None,
+            wgsl: wgsl.into(),
+            vertex_entry: "vs_main".into(),
+            fragment_entry: "fs_main".into(),
+        };
+
+        let error = validate_gpu_surface_render_program_stages(&module, &module_info, &desc)
+            .expect_err("vertex-stage UAV usage should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("vertex-stage writable storage buffers")
+        );
+    }
+
+    #[test]
+    fn rejects_vertex_stage_storage_texture_in_render_program() {
+        let wgsl = r#"
+struct GpuSurfaceFrame {
+    metrics: vec4<f32>,
+    extent_cursor: vec4<f32>,
+    surface_cursor: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> frame: GpuSurfaceFrame;
+
+@group(0) @binding(1)
+var output_tex: texture_storage_2d<rgba8unorm, write>;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    textureStore(output_tex, vec2<i32>(i32(vertex_index), 0), vec4<f32>(1.0, 0.0, 0.0, 1.0));
+    return VertexOutput(vec4<f32>(0.0, 0.0, 0.0, 1.0));
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+}
+"#;
+        let module = naga::front::wgsl::parse_str(wgsl).expect("WGSL should parse");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator.subgroup_stages(naga::valid::ShaderStages::all());
+        validator.subgroup_operations(naga::valid::SubgroupOperationSet::all());
+        let module_info = validator.validate(&module).expect("WGSL should validate");
+        let desc = nekowg::GpuRenderProgramDesc {
+            label: None,
+            wgsl: wgsl.into(),
+            vertex_entry: "vs_main".into(),
+            fragment_entry: "fs_main".into(),
+        };
+
+        let error = validate_gpu_surface_render_program_stages(&module, &module_info, &desc)
+            .expect_err("vertex-stage storage texture usage should be rejected");
+
+        assert!(error.to_string().contains("vertex-stage storage textures"));
+    }
+
+    #[test]
+    fn accepts_vertex_stage_read_only_storage_buffer_in_render_program() {
+        let wgsl = r#"
+struct GpuSurfaceFrame {
+    metrics: vec4<f32>,
+    extent_cursor: vec4<f32>,
+    surface_cursor: vec4<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> frame: GpuSurfaceFrame;
+
+@group(0) @binding(1)
+var<storage, read> values: array<u32>;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+    let x = f32(values[min(vertex_index, 0u)]);
+    return VertexOutput(vec4<f32>(x, 0.0, 0.0, 1.0));
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 1.0, 1.0);
+}
+"#;
+        let module = naga::front::wgsl::parse_str(wgsl).expect("WGSL should parse");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator.subgroup_stages(naga::valid::ShaderStages::all());
+        validator.subgroup_operations(naga::valid::SubgroupOperationSet::all());
+        let module_info = validator.validate(&module).expect("WGSL should validate");
+        let desc = nekowg::GpuRenderProgramDesc {
+            label: None,
+            wgsl: wgsl.into(),
+            vertex_entry: "vs_main".into(),
+            fragment_entry: "fs_main".into(),
+        };
+
+        validate_gpu_surface_render_program_stages(&module, &module_info, &desc)
+            .expect("read-only storage SRV should remain valid in vertex stage");
     }
 }
 

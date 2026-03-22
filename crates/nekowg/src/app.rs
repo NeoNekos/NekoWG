@@ -2243,7 +2243,8 @@ impl App {
         );
 
         if window_invalidators.is_empty() {
-            if self.pending_notifications.insert(entity_id) {
+            let inserted = self.pending_notifications.insert(entity_id);
+            if inserted {
                 self.pending_effects
                     .push_back(Effect::Notify { emitter: entity_id });
             }

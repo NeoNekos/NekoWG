@@ -1,4 +1,5 @@
 use crate::{App, Bounds, ContentMask, ElementId, Pixels, Point, ScaledPixels, SharedString};
+use bytemuck::Pod;
 use scheduler::Instant;
 use std::{collections::HashMap, mem, time::Duration};
 
@@ -328,6 +329,16 @@ pub(crate) enum GpuGraphValidationError {
     MissingSampler(GpuSamplerHandle),
     MissingRenderProgram(GpuRenderProgramHandle),
     MissingComputeProgram(GpuComputeProgramHandle),
+    NonRenderableTarget(GpuTextureHandle),
+    NonSampledPresentTexture(GpuTextureHandle),
+    NonUniformBufferBinding(GpuBufferHandle),
+    NonStorageBufferBinding(GpuBufferHandle),
+    NonSampledTextureBinding(GpuTextureHandle),
+    NonStorageTextureBinding(GpuTextureHandle),
+    RenderTargetSampledConflict(GpuTextureHandle),
+    RenderTargetStorageConflict(GpuTextureHandle),
+    SampledStorageTextureConflict(GpuTextureHandle),
+    UniformStorageBufferConflict(GpuBufferHandle),
     BufferWriteOutOfBounds {
         handle: GpuBufferHandle,
         offset: u64,
@@ -426,14 +437,6 @@ impl GpuResourceRegistry {
         self.release_textures(&resources.textures);
         self.release_buffers(&resources.buffers);
         self.release_samplers(&resources.samplers);
-    }
-
-    fn has_texture(&self, handle: GpuTextureHandle) -> bool {
-        self.textures.contains_key(&handle)
-    }
-
-    fn has_buffer(&self, handle: GpuBufferHandle) -> bool {
-        self.buffers.contains_key(&handle)
     }
 
     fn has_sampler(&self, handle: GpuSamplerHandle) -> bool {
@@ -654,19 +657,13 @@ impl<'a> GpuGraphContext<'a> {
     }
 
     /// Records a typed upload for a single plain-old-data value.
-    pub fn write_buffer_value<T: Copy>(&mut self, buffer: GpuBufferHandle, value: &T) {
-        let bytes = unsafe {
-            std::slice::from_raw_parts((value as *const T).cast::<u8>(), std::mem::size_of::<T>())
-        };
-        self.write_buffer(buffer, bytes);
+    pub fn write_buffer_value<T: Pod>(&mut self, buffer: GpuBufferHandle, value: &T) {
+        self.write_buffer(buffer, bytemuck::bytes_of(value));
     }
 
     /// Records a typed upload for a slice of plain-old-data values.
-    pub fn write_buffer_slice<T: Copy>(&mut self, buffer: GpuBufferHandle, values: &[T]) {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-        };
-        self.write_buffer(buffer, bytes);
+    pub fn write_buffer_slice<T: Pod>(&mut self, buffer: GpuBufferHandle, values: &[T]) {
+        self.write_buffer(buffer, bytemuck::cast_slice(values));
     }
 
     /// Records a render pass.
@@ -725,9 +722,13 @@ impl GpuRecordedGraph {
                     if !resources.has_render_program(pass.program) {
                         return Err(GpuGraphValidationError::MissingRenderProgram(pass.program));
                     }
-                    if !resources.has_texture(pass.target) {
+                    let Some(target_desc) = resources.textures.get(&pass.target) else {
                         return Err(GpuGraphValidationError::MissingTexture(pass.target));
+                    };
+                    if !target_desc.render_attachment {
+                        return Err(GpuGraphValidationError::NonRenderableTarget(pass.target));
                     }
+                    validate_render_pass_hazards(pass)?;
                     for binding in &pass.bindings {
                         validate_binding(*binding, resources)?;
                     }
@@ -736,6 +737,7 @@ impl GpuRecordedGraph {
                     if !resources.has_compute_program(pass.program) {
                         return Err(GpuGraphValidationError::MissingComputeProgram(pass.program));
                     }
+                    validate_compute_pass_hazards(pass)?;
                     for binding in &pass.bindings {
                         validate_binding(*binding, resources)?;
                     }
@@ -743,13 +745,104 @@ impl GpuRecordedGraph {
             }
         }
 
-        if let Some(texture) = self.presented
-            && !resources.has_texture(texture)
-        {
-            return Err(GpuGraphValidationError::MissingTexture(texture));
+        if let Some(texture) = self.presented {
+            let Some(texture_desc) = resources.textures.get(&texture) else {
+                return Err(GpuGraphValidationError::MissingTexture(texture));
+            };
+            if !texture_desc.sampled {
+                return Err(GpuGraphValidationError::NonSampledPresentTexture(texture));
+            }
         }
 
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuPassTextureUsage {
+    Sampled,
+    Storage,
+    RenderTarget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuPassBufferUsage {
+    Uniform,
+    Storage,
+}
+
+fn validate_render_pass_hazards(pass: &GpuRenderPassDesc) -> Result<(), GpuGraphValidationError> {
+    let mut textures = HashMap::<GpuTextureHandle, GpuPassTextureUsage>::default();
+    textures.insert(pass.target, GpuPassTextureUsage::RenderTarget);
+    let mut buffers = HashMap::<GpuBufferHandle, GpuPassBufferUsage>::default();
+    validate_pass_hazards(&pass.bindings, &mut textures, &mut buffers)
+}
+
+fn validate_compute_pass_hazards(pass: &GpuComputePassDesc) -> Result<(), GpuGraphValidationError> {
+    let mut textures = HashMap::<GpuTextureHandle, GpuPassTextureUsage>::default();
+    let mut buffers = HashMap::<GpuBufferHandle, GpuPassBufferUsage>::default();
+    validate_pass_hazards(&pass.bindings, &mut textures, &mut buffers)
+}
+
+fn validate_pass_hazards(
+    bindings: &[GpuBinding],
+    textures: &mut HashMap<GpuTextureHandle, GpuPassTextureUsage>,
+    buffers: &mut HashMap<GpuBufferHandle, GpuPassBufferUsage>,
+) -> Result<(), GpuGraphValidationError> {
+    for binding in bindings {
+        match *binding {
+            GpuBinding::UniformBuffer(handle) => {
+                validate_buffer_pass_usage(handle, GpuPassBufferUsage::Uniform, buffers)?
+            }
+            GpuBinding::StorageBuffer(handle) => {
+                validate_buffer_pass_usage(handle, GpuPassBufferUsage::Storage, buffers)?
+            }
+            GpuBinding::SampledTexture(handle) => {
+                validate_texture_pass_usage(handle, GpuPassTextureUsage::Sampled, textures)?
+            }
+            GpuBinding::StorageTexture(handle) => {
+                validate_texture_pass_usage(handle, GpuPassTextureUsage::Storage, textures)?
+            }
+            GpuBinding::Sampler(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_texture_pass_usage(
+    handle: GpuTextureHandle,
+    usage: GpuPassTextureUsage,
+    usages: &mut HashMap<GpuTextureHandle, GpuPassTextureUsage>,
+) -> Result<(), GpuGraphValidationError> {
+    match usages.insert(handle, usage) {
+        None => Ok(()),
+        Some(previous) if previous == usage => Ok(()),
+        Some(GpuPassTextureUsage::RenderTarget) => match usage {
+            GpuPassTextureUsage::Sampled => {
+                Err(GpuGraphValidationError::RenderTargetSampledConflict(handle))
+            }
+            GpuPassTextureUsage::Storage => {
+                Err(GpuGraphValidationError::RenderTargetStorageConflict(handle))
+            }
+            GpuPassTextureUsage::RenderTarget => Ok(()),
+        },
+        Some(GpuPassTextureUsage::Sampled) | Some(GpuPassTextureUsage::Storage) => Err(
+            GpuGraphValidationError::SampledStorageTextureConflict(handle),
+        ),
+    }
+}
+
+fn validate_buffer_pass_usage(
+    handle: GpuBufferHandle,
+    usage: GpuPassBufferUsage,
+    usages: &mut HashMap<GpuBufferHandle, GpuPassBufferUsage>,
+) -> Result<(), GpuGraphValidationError> {
+    match usages.insert(handle, usage) {
+        None => Ok(()),
+        Some(previous) if previous == usage => Ok(()),
+        Some(GpuPassBufferUsage::Uniform) | Some(GpuPassBufferUsage::Storage) => Err(
+            GpuGraphValidationError::UniformStorageBufferConflict(handle),
+        ),
     }
 }
 
@@ -758,18 +851,44 @@ fn validate_binding(
     resources: &GpuResourceRegistry,
 ) -> Result<(), GpuGraphValidationError> {
     match binding {
-        GpuBinding::UniformBuffer(handle) | GpuBinding::StorageBuffer(handle) => {
-            if resources.has_buffer(handle) {
-                Ok(())
+        GpuBinding::UniformBuffer(handle) => {
+            let Some(desc) = resources.buffers.get(&handle) else {
+                return Err(GpuGraphValidationError::MissingBuffer(handle));
+            };
+            if desc.usage != GpuBufferUsage::Uniform {
+                Err(GpuGraphValidationError::NonUniformBufferBinding(handle))
             } else {
-                Err(GpuGraphValidationError::MissingBuffer(handle))
+                Ok(())
             }
         }
-        GpuBinding::SampledTexture(handle) | GpuBinding::StorageTexture(handle) => {
-            if resources.has_texture(handle) {
-                Ok(())
+        GpuBinding::StorageBuffer(handle) => {
+            let Some(desc) = resources.buffers.get(&handle) else {
+                return Err(GpuGraphValidationError::MissingBuffer(handle));
+            };
+            if desc.usage != GpuBufferUsage::Storage {
+                Err(GpuGraphValidationError::NonStorageBufferBinding(handle))
             } else {
-                Err(GpuGraphValidationError::MissingTexture(handle))
+                Ok(())
+            }
+        }
+        GpuBinding::SampledTexture(handle) => {
+            let Some(desc) = resources.textures.get(&handle) else {
+                return Err(GpuGraphValidationError::MissingTexture(handle));
+            };
+            if !desc.sampled {
+                Err(GpuGraphValidationError::NonSampledTextureBinding(handle))
+            } else {
+                Ok(())
+            }
+        }
+        GpuBinding::StorageTexture(handle) => {
+            let Some(desc) = resources.textures.get(&handle) else {
+                return Err(GpuGraphValidationError::MissingTexture(handle));
+            };
+            if !desc.storage {
+                Err(GpuGraphValidationError::NonStorageTextureBinding(handle))
+            } else {
+                Ok(())
             }
         }
         GpuBinding::Sampler(handle) => {
@@ -1282,6 +1401,186 @@ mod tests {
         assert_eq!(
             error,
             GpuGraphValidationError::MissingTexture(GpuTextureHandle(999))
+        );
+    }
+
+    #[test]
+    fn render_target_must_be_renderable() {
+        let mut resources = GpuResourceRegistry::default();
+        let mut graph = GpuRecordedGraph::default();
+        let mut init = GpuInitContext::new(&mut resources);
+        let program = init.render_program(GpuRenderProgramDesc {
+            label: None,
+            wgsl: "render".into(),
+            vertex_entry: "vs_main".into(),
+            fragment_entry: "fs_main".into(),
+        });
+        let target = init.persistent_texture(GpuTextureDesc {
+            sampled: true,
+            ..GpuTextureDesc::default()
+        });
+        let mut cx = GpuGraphContext::new(&mut resources, &mut graph);
+        cx.render_pass(GpuRenderPassDesc {
+            label: None,
+            program,
+            target,
+            clear_color: None,
+            bindings: Vec::new(),
+            draw: GpuDrawCall::FullScreenTriangle,
+        });
+
+        assert_eq!(
+            graph.validate(&resources),
+            Err(GpuGraphValidationError::NonRenderableTarget(target))
+        );
+    }
+
+    #[test]
+    fn present_texture_must_be_sampleable() {
+        let mut resources = GpuResourceRegistry::default();
+        let mut graph = GpuRecordedGraph::default();
+        let mut init = GpuInitContext::new(&mut resources);
+        let target = init.persistent_texture(GpuTextureDesc {
+            render_attachment: true,
+            ..GpuTextureDesc::default()
+        });
+        let mut cx = GpuGraphContext::new(&mut resources, &mut graph);
+        cx.present(target);
+
+        assert_eq!(
+            graph.validate(&resources),
+            Err(GpuGraphValidationError::NonSampledPresentTexture(target))
+        );
+    }
+
+    #[test]
+    fn uniform_binding_requires_uniform_buffer_usage() {
+        let mut resources = GpuResourceRegistry::default();
+        let mut init = GpuInitContext::new(&mut resources);
+        let storage = init.storage_buffer(GpuBufferDesc {
+            size: 16,
+            ..GpuBufferDesc::default()
+        });
+
+        assert_eq!(
+            validate_binding(GpuBinding::UniformBuffer(storage), &resources),
+            Err(GpuGraphValidationError::NonUniformBufferBinding(storage))
+        );
+    }
+
+    #[test]
+    fn sampled_binding_requires_sampled_texture_usage() {
+        let mut resources = GpuResourceRegistry::default();
+        let mut init = GpuInitContext::new(&mut resources);
+        let storage_only = init.persistent_texture(GpuTextureDesc {
+            storage: true,
+            ..GpuTextureDesc::default()
+        });
+
+        assert_eq!(
+            validate_binding(GpuBinding::SampledTexture(storage_only), &resources),
+            Err(GpuGraphValidationError::NonSampledTextureBinding(
+                storage_only
+            ))
+        );
+    }
+
+    #[test]
+    fn render_pass_rejects_sampling_its_own_target() {
+        let mut resources = GpuResourceRegistry::default();
+        let mut graph = GpuRecordedGraph::default();
+        let mut init = GpuInitContext::new(&mut resources);
+        let program = init.render_program(GpuRenderProgramDesc {
+            label: None,
+            wgsl: "render".into(),
+            vertex_entry: "vs_main".into(),
+            fragment_entry: "fs_main".into(),
+        });
+        let target = init.persistent_texture(GpuTextureDesc {
+            sampled: true,
+            render_attachment: true,
+            ..GpuTextureDesc::default()
+        });
+        let mut cx = GpuGraphContext::new(&mut resources, &mut graph);
+        cx.render_pass(GpuRenderPassDesc {
+            label: None,
+            program,
+            target,
+            clear_color: None,
+            bindings: vec![GpuBinding::SampledTexture(target)],
+            draw: GpuDrawCall::FullScreenTriangle,
+        });
+
+        assert_eq!(
+            graph.validate(&resources),
+            Err(GpuGraphValidationError::RenderTargetSampledConflict(target))
+        );
+    }
+
+    #[test]
+    fn compute_pass_rejects_sampled_and_storage_texture_alias() {
+        let mut resources = GpuResourceRegistry::default();
+        let mut graph = GpuRecordedGraph::default();
+        let mut init = GpuInitContext::new(&mut resources);
+        let program = init.compute_program(GpuComputeProgramDesc {
+            label: None,
+            wgsl: "compute".into(),
+            entry: "cs_main".into(),
+        });
+        let texture = init.persistent_texture(GpuTextureDesc {
+            sampled: true,
+            storage: true,
+            ..GpuTextureDesc::default()
+        });
+        let mut cx = GpuGraphContext::new(&mut resources, &mut graph);
+        cx.compute_pass(GpuComputePassDesc {
+            label: None,
+            program,
+            bindings: vec![
+                GpuBinding::SampledTexture(texture),
+                GpuBinding::StorageTexture(texture),
+            ],
+            workgroups: [1, 1, 1],
+        });
+
+        assert_eq!(
+            graph.validate(&resources),
+            Err(GpuGraphValidationError::SampledStorageTextureConflict(
+                texture
+            ))
+        );
+    }
+
+    #[test]
+    fn pass_rejects_uniform_and_storage_buffer_alias() {
+        let mut resources = GpuResourceRegistry::default();
+        let mut graph = GpuRecordedGraph::default();
+        let mut init = GpuInitContext::new(&mut resources);
+        let program = init.compute_program(GpuComputeProgramDesc {
+            label: None,
+            wgsl: "compute".into(),
+            entry: "cs_main".into(),
+        });
+        let buffer = init.storage_buffer(GpuBufferDesc {
+            size: 16,
+            ..GpuBufferDesc::default()
+        });
+        let mut cx = GpuGraphContext::new(&mut resources, &mut graph);
+        cx.compute_pass(GpuComputePassDesc {
+            label: None,
+            program,
+            bindings: vec![
+                GpuBinding::StorageBuffer(buffer),
+                GpuBinding::UniformBuffer(buffer),
+            ],
+            workgroups: [1, 1, 1],
+        });
+
+        assert_eq!(
+            graph.validate(&resources),
+            Err(GpuGraphValidationError::UniformStorageBufferConflict(
+                buffer
+            ))
         );
     }
 

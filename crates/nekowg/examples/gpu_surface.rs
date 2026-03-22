@@ -62,11 +62,14 @@ var source_tex: texture_2d<f32>;
 @group(0) @binding(2)
 var source_sampler: sampler;
 
+@group(0) @binding(3)
+var<storage, read> palette: array<vec4<f32>>;
+
 struct CompositeParams {
     tint: vec4<f32>,
 };
 
-@group(0) @binding(3)
+@group(0) @binding(4)
 var<uniform> params: CompositeParams;
 
 struct VertexOutput {
@@ -95,24 +98,20 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let sampled = textureSample(source_tex, source_sampler, input.uv);
     let cursor = frame.surface_cursor.xy / max(frame.extent_cursor.xy, vec2<f32>(1.0, 1.0));
     let glow = smoothstep(0.20, 0.0, distance(input.uv, cursor)) * frame.metrics.w;
+    let accent = palette[0].rgb * 0.22 + palette[1].rgb * (0.12 + glow * 0.25);
     return vec4<f32>(
-        sampled.rgb + params.tint.rgb + glow * vec3<f32>(0.55, 0.18, 0.75),
+        sampled.rgb + params.tint.rgb + accent + glow * vec3<f32>(0.55, 0.18, 0.75),
         1.0,
     );
 }
 "#;
-
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-struct CompositeParams {
-    tint: [f32; 4],
-}
 
 struct ClearSurfaceRenderer {
     generated: Option<GpuTextureHandle>,
     output: Option<GpuTextureHandle>,
     compute_program: Option<GpuComputeProgramHandle>,
     composite_program: Option<GpuRenderProgramHandle>,
+    palette_buffer: Option<GpuBufferHandle>,
     params_buffer: Option<GpuBufferHandle>,
     sampler: Option<GpuSamplerHandle>,
     extent: GpuExtent,
@@ -147,9 +146,14 @@ impl GpuSurfaceRenderer for ClearSurfaceRenderer {
                 .with_label("gpu_surface_composite"),
             ),
         );
+        self.palette_buffer = Some(cx.storage_buffer(GpuBufferDesc {
+            label: Some("composite_palette".into()),
+            size: std::mem::size_of::<[[f32; 4]; 4]>() as u64,
+            ..GpuBufferDesc::default()
+        }));
         self.params_buffer = Some(cx.uniform_buffer(GpuBufferDesc {
             label: Some("composite_params".into()),
-            size: std::mem::size_of::<CompositeParams>() as u64,
+            size: std::mem::size_of::<[f32; 4]>() as u64,
             ..GpuBufferDesc::default()
         }));
         self.sampler = Some(cx.sampler(GpuSamplerDesc::default().with_label("surface_sampler")));
@@ -203,6 +207,7 @@ impl GpuSurfaceRenderer for ClearSurfaceRenderer {
             Some(output),
             Some(compute_program),
             Some(composite_program),
+            Some(palette_buffer),
             Some(params_buffer),
             Some(sampler),
         ) = (
@@ -210,6 +215,7 @@ impl GpuSurfaceRenderer for ClearSurfaceRenderer {
             self.output,
             self.compute_program,
             self.composite_program,
+            self.palette_buffer,
             self.params_buffer,
             self.sampler,
         )
@@ -217,12 +223,17 @@ impl GpuSurfaceRenderer for ClearSurfaceRenderer {
             return;
         };
 
+        let palette: [[f32; 4]; 4] = [
+            [0.92, 0.36, 0.80, 1.0],
+            [0.20, 0.76, 0.98, 1.0],
+            [0.10, 0.18, 0.26, 1.0],
+            [0.96, 0.96, 0.98, 1.0],
+        ];
+        graph.write_buffer_slice(palette_buffer, &palette);
         let tint = 0.5 + 0.5 * self.time.sin();
         graph.write_buffer_value(
             params_buffer,
-            &CompositeParams {
-                tint: [0.08 * tint, 0.02 * (1.0 - tint), 0.12 * tint, 1.0],
-            },
+            &[0.08 * tint, 0.02 * (1.0 - tint), 0.12 * tint, 1.0],
         );
 
         graph.compute_pass(GpuComputePassDesc {
@@ -243,9 +254,13 @@ impl GpuSurfaceRenderer for ClearSurfaceRenderer {
             bindings: vec![
                 GpuBinding::SampledTexture(generated),
                 GpuBinding::Sampler(sampler),
+                GpuBinding::StorageBuffer(palette_buffer),
                 GpuBinding::UniformBuffer(params_buffer),
             ],
-            draw: GpuDrawCall::FullScreenTriangle,
+            draw: GpuDrawCall::Triangles {
+                vertex_count: 3,
+                instance_count: 1,
+            },
         });
         graph.present(output);
     }
@@ -280,6 +295,7 @@ impl Render for GpuSurfaceClearDemo {
                             output: None,
                             compute_program: None,
                             composite_program: None,
+                            palette_buffer: None,
                             params_buffer: None,
                             sampler: None,
                             extent: GpuExtent::default(),
