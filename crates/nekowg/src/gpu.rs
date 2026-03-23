@@ -1148,7 +1148,13 @@ mod tests {
         fn update(&mut self, _next_renderer: Self) {}
 
         fn encode(&mut self, graph: &mut GpuGraphContext<'_>) {
-            let texture = graph.transient_texture(GpuTextureDesc::default().with_label("frame"));
+            let texture = graph.transient_texture(
+                GpuTextureDesc {
+                    sampled: true,
+                    ..GpuTextureDesc::default()
+                }
+                .with_label("frame"),
+            );
             graph.present(texture);
         }
     }

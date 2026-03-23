@@ -218,6 +218,37 @@ enum MetalGpuSurfaceProgramBindingKind {
     Sampler,
 }
 
+fn gpu_texture_desc_matches(lhs: &GpuTextureDesc, rhs: &GpuTextureDesc) -> bool {
+    lhs.extent == rhs.extent
+        && lhs.format == rhs.format
+        && lhs.sampled == rhs.sampled
+        && lhs.storage == rhs.storage
+        && lhs.render_attachment == rhs.render_attachment
+        && lhs.copy_src == rhs.copy_src
+        && lhs.copy_dst == rhs.copy_dst
+}
+
+fn gpu_buffer_desc_matches(lhs: &GpuBufferDesc, rhs: &GpuBufferDesc) -> bool {
+    lhs.usage == rhs.usage && lhs.size == rhs.size
+}
+
+fn gpu_sampler_desc_matches(_lhs: &GpuSamplerDesc, _rhs: &GpuSamplerDesc) -> bool {
+    true
+}
+
+fn gpu_render_program_desc_matches(lhs: &GpuRenderProgramDesc, rhs: &GpuRenderProgramDesc) -> bool {
+    lhs.wgsl == rhs.wgsl
+        && lhs.vertex_entry == rhs.vertex_entry
+        && lhs.fragment_entry == rhs.fragment_entry
+}
+
+fn gpu_compute_program_desc_matches(
+    lhs: &GpuComputeProgramDesc,
+    rhs: &GpuComputeProgramDesc,
+) -> bool {
+    lhs.wgsl == rhs.wgsl && lhs.entry == rhs.entry
+}
+
 #[repr(C)]
 pub struct PathRasterizationVertex {
     pub xy_position: Point<ScaledPixels>,
@@ -328,7 +359,7 @@ impl MetalGpuSurfaceState {
             let needs_recreate = self
                 .textures
                 .get(&handle)
-                .is_none_or(|texture| texture.desc != *desc);
+                .is_none_or(|texture| !gpu_texture_desc_matches(&texture.desc, desc));
             if needs_recreate {
                 self.textures
                     .insert(handle, create_gpu_surface_texture(device, desc)?);
@@ -349,7 +380,7 @@ impl MetalGpuSurfaceState {
             let needs_recreate = self
                 .buffers
                 .get(&handle)
-                .is_none_or(|buffer| buffer.desc != *desc);
+                .is_none_or(|buffer| !gpu_buffer_desc_matches(&buffer.desc, desc));
             if needs_recreate {
                 self.buffers.insert(
                     handle,
@@ -371,7 +402,7 @@ impl MetalGpuSurfaceState {
             let needs_recreate = self
                 .samplers
                 .get(&handle)
-                .is_none_or(|sampler| sampler.desc != *desc);
+                .is_none_or(|sampler| !gpu_sampler_desc_matches(&sampler.desc, desc));
             if needs_recreate {
                 self.samplers
                     .insert(handle, create_gpu_surface_sampler(device, desc));
@@ -390,7 +421,7 @@ impl MetalGpuSurfaceState {
             let needs_recreate = self
                 .render_programs
                 .get(&handle)
-                .is_none_or(|program| program.desc != *desc);
+                .is_none_or(|program| !gpu_render_program_desc_matches(&program.desc, desc));
             if needs_recreate {
                 self.render_programs
                     .insert(handle, create_gpu_surface_render_program(device, desc)?);
@@ -410,7 +441,7 @@ impl MetalGpuSurfaceState {
             let needs_recreate = self
                 .compute_programs
                 .get(&handle)
-                .is_none_or(|program| program.desc != *desc);
+                .is_none_or(|program| !gpu_compute_program_desc_matches(&program.desc, desc));
             if needs_recreate {
                 self.compute_programs
                     .insert(handle, create_gpu_surface_compute_program(device, desc)?);

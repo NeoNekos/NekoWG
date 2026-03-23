@@ -54,6 +54,11 @@ pub(crate) struct DirectXRenderer {
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
     gpu_surfaces: HashMap<u64, DirectXGpuSurfaceState>,
+    gpu_surface_sampler: ID3D11SamplerState,
+    gpu_surface_render_program_cache:
+        HashMap<DirectXGpuSurfaceRenderProgramCacheKey, Arc<DirectXGpuSurfaceRenderProgram>>,
+    gpu_surface_compute_program_cache:
+        HashMap<DirectXGpuSurfaceComputeProgramCacheKey, Arc<DirectXGpuSurfaceComputeProgram>>,
     frame_serial: u64,
 }
 
@@ -135,11 +140,16 @@ struct DirectXGpuSurfaceState {
     texture_pool: DirectXGpuSurfaceTexturePool<DirectXGpuSurfaceTexture>,
     buffers: HashMap<GpuBufferHandle, DirectXGpuSurfaceBuffer>,
     samplers: HashMap<GpuSamplerHandle, DirectXGpuSurfaceSampler>,
-    render_programs: HashMap<GpuRenderProgramHandle, DirectXGpuSurfaceRenderProgram>,
-    compute_programs: HashMap<GpuComputeProgramHandle, DirectXGpuSurfaceComputeProgram>,
+    render_programs: HashMap<GpuRenderProgramHandle, Arc<DirectXGpuSurfaceRenderProgram>>,
+    compute_programs: HashMap<GpuComputeProgramHandle, Arc<DirectXGpuSurfaceComputeProgram>>,
     frame_uniform_buffer: ID3D11Buffer,
     render_blend_state: ID3D11BlendState,
     rasterizer_state: ID3D11RasterizerState,
+    constant_buffer_scratch: Vec<(u32, ID3D11Buffer)>,
+    shader_resource_scratch: Vec<(u32, ID3D11ShaderResourceView)>,
+    unordered_access_scratch: Vec<(u32, ID3D11UnorderedAccessView)>,
+    sampler_scratch: Vec<(u32, ID3D11SamplerState)>,
+    uav_slot_scratch: Vec<Option<ID3D11UnorderedAccessView>>,
     last_used_frame: u64,
 }
 
@@ -162,6 +172,8 @@ struct DirectXGpuSurfaceTexturePoolKey {
     copy_dst: bool,
 }
 
+const GPU_SURFACE_TEXTURE_POOL_MAX_CACHED_BYTES: usize = 32 * 1024 * 1024;
+
 impl From<&GpuTextureDesc> for DirectXGpuSurfaceTexturePoolKey {
     fn from(desc: &GpuTextureDesc) -> Self {
         Self {
@@ -176,13 +188,33 @@ impl From<&GpuTextureDesc> for DirectXGpuSurfaceTexturePoolKey {
     }
 }
 
+impl DirectXGpuSurfaceTexturePoolKey {
+    fn estimated_bytes(self) -> usize {
+        let bytes_per_pixel = match self.format {
+            GpuTextureFormat::Rgba8Unorm | GpuTextureFormat::Bgra8Unorm => 4,
+            GpuTextureFormat::Rgba16Float => 8,
+            GpuTextureFormat::R32Float => 4,
+            GpuTextureFormat::Rgba32Float => 16,
+        };
+        self.extent.width.max(1) as usize * self.extent.height.max(1) as usize * bytes_per_pixel
+    }
+}
+
 struct DirectXGpuSurfaceTexturePool<T> {
     textures: HashMap<DirectXGpuSurfaceTexturePoolKey, Vec<T>>,
+    cached_bytes: usize,
 }
 
 impl<T> DirectXGpuSurfaceTexturePool<T> {
     fn recycle(&mut self, key: DirectXGpuSurfaceTexturePoolKey, texture: T) {
+        let estimated_bytes = key.estimated_bytes();
+        if self.cached_bytes.saturating_add(estimated_bytes)
+            > GPU_SURFACE_TEXTURE_POOL_MAX_CACHED_BYTES
+        {
+            return;
+        }
         self.textures.entry(key).or_default().push(texture);
+        self.cached_bytes += estimated_bytes;
     }
 
     fn take(&mut self, desc: &GpuTextureDesc) -> Option<T> {
@@ -190,6 +222,9 @@ impl<T> DirectXGpuSurfaceTexturePool<T> {
         let mut value = None;
         if let std::collections::hash_map::Entry::Occupied(mut entry) = self.textures.entry(key) {
             value = entry.get_mut().pop();
+            if value.is_some() {
+                self.cached_bytes = self.cached_bytes.saturating_sub(key.estimated_bytes());
+            }
             if entry.get().is_empty() {
                 entry.remove();
             }
@@ -207,6 +242,7 @@ impl<T> Default for DirectXGpuSurfaceTexturePool<T> {
     fn default() -> Self {
         Self {
             textures: HashMap::default(),
+            cached_bytes: 0,
         }
     }
 }
@@ -218,18 +254,50 @@ struct DirectXGpuSurfaceRenderProgram {
     bindings: Vec<DirectXGpuSurfaceProgramBinding>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DirectXGpuSurfaceRenderProgramCacheKey {
+    wgsl: SharedString,
+    vertex_entry: SharedString,
+    fragment_entry: SharedString,
+}
+
 struct DirectXGpuSurfaceComputeProgram {
     desc: GpuComputeProgramDesc,
     compute: ID3D11ComputeShader,
     bindings: Vec<DirectXGpuSurfaceProgramBinding>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DirectXGpuSurfaceComputeProgramCacheKey {
+    wgsl: SharedString,
+    entry: SharedString,
+}
+
+impl From<&GpuRenderProgramDesc> for DirectXGpuSurfaceRenderProgramCacheKey {
+    fn from(desc: &GpuRenderProgramDesc) -> Self {
+        Self {
+            wgsl: desc.wgsl.clone(),
+            vertex_entry: desc.vertex_entry.clone(),
+            fragment_entry: desc.fragment_entry.clone(),
+        }
+    }
+}
+
+impl From<&GpuComputeProgramDesc> for DirectXGpuSurfaceComputeProgramCacheKey {
+    fn from(desc: &GpuComputeProgramDesc) -> Self {
+        Self {
+            wgsl: desc.wgsl.clone(),
+            entry: desc.entry.clone(),
+        }
+    }
+}
+
 struct DirectXGpuSurfaceBuffer {
     desc: GpuBufferDesc,
     buffer: ID3D11Buffer,
-    data: Vec<u8>,
     shader_resource_view: Option<ID3D11ShaderResourceView>,
     unordered_access_view: Option<ID3D11UnorderedAccessView>,
+    shadow_data: Option<Vec<u8>>,
 }
 
 struct DirectXGpuSurfaceSampler {
@@ -261,6 +329,37 @@ struct GpuSurfaceFrameUniform {
     surface_cursor: [f32; 4],
 }
 
+fn gpu_texture_desc_matches(lhs: &GpuTextureDesc, rhs: &GpuTextureDesc) -> bool {
+    lhs.extent == rhs.extent
+        && lhs.format == rhs.format
+        && lhs.sampled == rhs.sampled
+        && lhs.storage == rhs.storage
+        && lhs.render_attachment == rhs.render_attachment
+        && lhs.copy_src == rhs.copy_src
+        && lhs.copy_dst == rhs.copy_dst
+}
+
+fn gpu_buffer_desc_matches(lhs: &GpuBufferDesc, rhs: &GpuBufferDesc) -> bool {
+    lhs.usage == rhs.usage && lhs.size == rhs.size
+}
+
+fn gpu_sampler_desc_matches(_lhs: &GpuSamplerDesc, _rhs: &GpuSamplerDesc) -> bool {
+    true
+}
+
+fn gpu_render_program_desc_matches(lhs: &GpuRenderProgramDesc, rhs: &GpuRenderProgramDesc) -> bool {
+    lhs.wgsl == rhs.wgsl
+        && lhs.vertex_entry == rhs.vertex_entry
+        && lhs.fragment_entry == rhs.fragment_entry
+}
+
+fn gpu_compute_program_desc_matches(
+    lhs: &GpuComputeProgramDesc,
+    rhs: &GpuComputeProgramDesc,
+) -> bool {
+    lhs.wgsl == rhs.wgsl && lhs.entry == rhs.entry
+}
+
 impl DirectXGpuSurfaceState {
     fn new(device: &ID3D11Device) -> Result<Self> {
         Ok(Self {
@@ -276,6 +375,11 @@ impl DirectXGpuSurfaceState {
             )?,
             render_blend_state: create_blend_state_no_blend(device)?,
             rasterizer_state: create_gpu_surface_rasterizer_state(device)?,
+            constant_buffer_scratch: Vec::new(),
+            shader_resource_scratch: Vec::new(),
+            unordered_access_scratch: Vec::new(),
+            sampler_scratch: Vec::new(),
+            uav_slot_scratch: Vec::new(),
             last_used_frame: 0,
         })
     }
@@ -302,7 +406,7 @@ impl DirectXGpuSurfaceState {
             let needs_recreate = self
                 .textures
                 .get(&handle)
-                .is_none_or(|texture| texture.desc != *desc);
+                .is_none_or(|texture| !gpu_texture_desc_matches(&texture.desc, desc));
             if needs_recreate {
                 if let Some(texture) = self.textures.remove(&handle) {
                     let key = DirectXGpuSurfaceTexturePoolKey::from(&texture.desc);
@@ -332,7 +436,7 @@ impl DirectXGpuSurfaceState {
             let needs_recreate = self
                 .buffers
                 .get(&handle)
-                .is_none_or(|buffer| buffer.desc != *desc);
+                .is_none_or(|buffer| !gpu_buffer_desc_matches(&buffer.desc, desc));
             if needs_recreate {
                 self.buffers
                     .insert(handle, create_gpu_surface_buffer(device, desc)?);
@@ -344,8 +448,8 @@ impl DirectXGpuSurfaceState {
 
     fn sync_samplers(
         &mut self,
-        device: &ID3D11Device,
         samplers: &HashMap<GpuSamplerHandle, GpuSamplerDesc>,
+        shared_sampler: &ID3D11SamplerState,
     ) -> Result<()> {
         self.samplers
             .retain(|handle, _| samplers.contains_key(handle));
@@ -354,10 +458,15 @@ impl DirectXGpuSurfaceState {
             let needs_recreate = self
                 .samplers
                 .get(&handle)
-                .is_none_or(|sampler| sampler.desc != *desc);
+                .is_none_or(|sampler| !gpu_sampler_desc_matches(&sampler.desc, desc));
             if needs_recreate {
-                self.samplers
-                    .insert(handle, create_gpu_surface_sampler(device, desc)?);
+                self.samplers.insert(
+                    handle,
+                    DirectXGpuSurfaceSampler {
+                        desc: desc.clone(),
+                        sampler: shared_sampler.clone(),
+                    },
+                );
             }
         }
 
@@ -368,6 +477,10 @@ impl DirectXGpuSurfaceState {
         &mut self,
         device: &ID3D11Device,
         render_programs: &HashMap<GpuRenderProgramHandle, GpuRenderProgramDesc>,
+        cache: &mut HashMap<
+            DirectXGpuSurfaceRenderProgramCacheKey,
+            Arc<DirectXGpuSurfaceRenderProgram>,
+        >,
     ) -> Result<()> {
         self.render_programs
             .retain(|handle, _| render_programs.contains_key(handle));
@@ -376,10 +489,17 @@ impl DirectXGpuSurfaceState {
             let needs_recreate = self
                 .render_programs
                 .get(&handle)
-                .is_none_or(|program| program.desc != *desc);
+                .is_none_or(|program| !gpu_render_program_desc_matches(&program.desc, desc));
             if needs_recreate {
-                self.render_programs
-                    .insert(handle, create_gpu_surface_render_program(device, desc)?);
+                let key = DirectXGpuSurfaceRenderProgramCacheKey::from(desc);
+                let program = if let Some(program) = cache.get(&key) {
+                    program.clone()
+                } else {
+                    let program = Arc::new(create_gpu_surface_render_program(device, desc)?);
+                    cache.insert(key, program.clone());
+                    program
+                };
+                self.render_programs.insert(handle, program);
             }
         }
 
@@ -390,6 +510,10 @@ impl DirectXGpuSurfaceState {
         &mut self,
         device: &ID3D11Device,
         compute_programs: &HashMap<GpuComputeProgramHandle, GpuComputeProgramDesc>,
+        cache: &mut HashMap<
+            DirectXGpuSurfaceComputeProgramCacheKey,
+            Arc<DirectXGpuSurfaceComputeProgram>,
+        >,
     ) -> Result<()> {
         self.compute_programs
             .retain(|handle, _| compute_programs.contains_key(handle));
@@ -398,10 +522,17 @@ impl DirectXGpuSurfaceState {
             let needs_recreate = self
                 .compute_programs
                 .get(&handle)
-                .is_none_or(|program| program.desc != *desc);
+                .is_none_or(|program| !gpu_compute_program_desc_matches(&program.desc, desc));
             if needs_recreate {
-                self.compute_programs
-                    .insert(handle, create_gpu_surface_compute_program(device, desc)?);
+                let key = DirectXGpuSurfaceComputeProgramCacheKey::from(desc);
+                let program = if let Some(program) = cache.get(&key) {
+                    program.clone()
+                } else {
+                    let program = Arc::new(create_gpu_surface_compute_program(device, desc)?);
+                    cache.insert(key, program.clone());
+                    program
+                };
+                self.compute_programs.insert(handle, program);
             }
         }
 
@@ -415,14 +546,20 @@ impl DirectXGpuSurfaceState {
         scale_factor: f32,
         graph: &GpuRecordedGraph,
     ) -> Result<()> {
+        let frame_uniform = gpu_surface_frame_uniform(frame, scale_factor);
+        update_buffer(
+            device_context,
+            &self.frame_uniform_buffer,
+            std::slice::from_ref(&frame_uniform),
+        )?;
         self.apply_buffer_writes(device_context, graph.buffer_writes())?;
         for operation in &graph.operations {
             match operation {
                 GpuGraphOperation::RenderPass(pass) => {
-                    self.execute_render_pass(device_context, frame, scale_factor, pass)?
+                    self.execute_render_pass(device_context, pass)?
                 }
                 GpuGraphOperation::ComputePass(pass) => {
-                    self.execute_compute_pass(device_context, frame, scale_factor, pass)?
+                    self.execute_compute_pass(device_context, pass)?
                 }
             }
         }
@@ -435,7 +572,6 @@ impl DirectXGpuSurfaceState {
         device_context: &ID3D11DeviceContext,
         writes: &[GpuBufferWrite],
     ) -> Result<()> {
-        let mut dirty_buffers = Vec::new();
         for write in writes {
             let buffer = self
                 .buffers
@@ -451,18 +587,7 @@ impl DirectXGpuSurfaceState {
                     buffer.desc.size
                 );
             }
-            buffer.data[start..end].copy_from_slice(&write.data);
-            if !dirty_buffers.contains(&write.buffer) {
-                dirty_buffers.push(write.buffer);
-            }
-        }
-
-        for handle in dirty_buffers {
-            let buffer = self
-                .buffers
-                .get(&handle)
-                .context("GpuSurface dirty buffer missing in DX11 state")?;
-            upload_gpu_surface_buffer(device_context, buffer)?;
+            upload_gpu_surface_buffer_write(device_context, buffer, write.offset, &write.data)?;
         }
 
         Ok(())
@@ -471,8 +596,6 @@ impl DirectXGpuSurfaceState {
     fn execute_render_pass(
         &mut self,
         device_context: &ID3D11DeviceContext,
-        frame: &GpuFrameContext,
-        scale_factor: f32,
         pass: &GpuRenderPassDesc,
     ) -> Result<()> {
         let target = self
@@ -484,19 +607,6 @@ impl DirectXGpuSurfaceState {
             .get(&pass.program)
             .context("GpuSurface render program missing in DX11 state")?;
 
-        if let Some(clear_color) = pass.clear_color {
-            let render_target_view = target
-                .render_target_view
-                .as_ref()
-                .context("GpuSurface render target is not renderable on DX11")?;
-            unsafe {
-                device_context.ClearRenderTargetView(
-                    render_target_view,
-                    &[clear_color.r, clear_color.g, clear_color.b, clear_color.a],
-                );
-            }
-        }
-
         if pass.bindings.len() != program.bindings.len() {
             anyhow::bail!(
                 "GpuSurface render pass binding count mismatch: shader expects {}, graph provides {}",
@@ -504,58 +614,72 @@ impl DirectXGpuSurfaceState {
                 pass.bindings.len()
             );
         }
+
         let render_target_view = target
             .render_target_view
-            .as_ref()
+            .clone()
             .context("GpuSurface render target is not renderable on DX11")?;
-        let frame_uniform = gpu_surface_frame_uniform(frame, scale_factor);
-        update_buffer(
-            device_context,
-            &self.frame_uniform_buffer,
-            std::slice::from_ref(&frame_uniform),
-        )?;
+        if let Some(clear_color) = pass.clear_color {
+            unsafe {
+                device_context.ClearRenderTargetView(
+                    &render_target_view,
+                    &[clear_color.r, clear_color.g, clear_color.b, clear_color.a],
+                );
+            }
+        }
 
+        let target_extent = target.desc.extent;
+        let vertex_shader = program.vertex.clone();
+        let fragment_shader = program.fragment.clone();
+        let program_bindings = &program.bindings;
+        let frame_uniform_buffer = [Some(self.frame_uniform_buffer.clone())];
+        let rasterizer_state = self.rasterizer_state.clone();
+        let render_blend_state = self.render_blend_state.clone();
         let viewport = D3D11_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,
-            Width: target.desc.extent.width.max(1) as f32,
-            Height: target.desc.extent.height.max(1) as f32,
+            Width: target_extent.width.max(1) as f32,
+            Height: target_extent.height.max(1) as f32,
             MinDepth: 0.0,
             MaxDepth: 1.0,
         };
         let scissor = RECT {
             left: 0,
             top: 0,
-            right: target.desc.extent.width.max(1) as i32,
-            bottom: target.desc.extent.height.max(1) as i32,
+            right: target_extent.width.max(1) as i32,
+            bottom: target_extent.height.max(1) as i32,
         };
-        let render_target = [Some(render_target_view.clone())];
-        let frame_uniform_buffer = [Some(self.frame_uniform_buffer.clone())];
-        let mut extra_constant_buffers = Vec::new();
-        let mut extra_shader_resources = Vec::new();
-        let mut extra_unordered_access_views = Vec::new();
-        let mut extra_samplers = Vec::new();
-        for (binding, layout) in pass.bindings.iter().zip(program.bindings.iter()) {
+        let render_target = [Some(render_target_view)];
+
+        self.constant_buffer_scratch.clear();
+        self.shader_resource_scratch.clear();
+        self.unordered_access_scratch.clear();
+        self.sampler_scratch.clear();
+        self.uav_slot_scratch.clear();
+
+        let buffers = &self.buffers;
+        let textures = &self.textures;
+        let samplers = &self.samplers;
+        for (binding, layout) in pass.bindings.iter().zip(program_bindings.iter()) {
             match (binding, layout.kind) {
                 (
                     GpuBinding::UniformBuffer(handle),
                     DirectXGpuSurfaceProgramBindingKind::UniformBuffer,
                 ) => {
-                    let buffer = self
-                        .buffers
+                    let buffer = buffers
                         .get(handle)
                         .context("GpuSurface uniform buffer binding missing in DX11 state")?;
                     if buffer.desc.usage != GpuBufferUsage::Uniform {
                         anyhow::bail!("GpuSurface uniform binding points to a non-uniform buffer");
                     }
-                    extra_constant_buffers.push((layout.slot, buffer.buffer.clone()));
+                    self.constant_buffer_scratch
+                        .push((layout.slot, buffer.buffer.clone()));
                 }
                 (
                     GpuBinding::StorageBuffer(handle),
                     DirectXGpuSurfaceProgramBindingKind::StorageBufferReadOnly,
                 ) => {
-                    let buffer = self
-                        .buffers
+                    let buffer = buffers
                         .get(handle)
                         .context("GpuSurface storage buffer binding missing in DX11 state")?;
                     if buffer.desc.usage != GpuBufferUsage::Storage {
@@ -565,14 +689,13 @@ impl DirectXGpuSurfaceState {
                         .shader_resource_view
                         .clone()
                         .context("GpuSurface storage buffer is not readable on DX11")?;
-                    extra_shader_resources.push((layout.slot, view));
+                    self.shader_resource_scratch.push((layout.slot, view));
                 }
                 (
                     GpuBinding::StorageBuffer(handle),
                     DirectXGpuSurfaceProgramBindingKind::StorageBufferReadWrite,
                 ) => {
-                    let buffer = self
-                        .buffers
+                    let buffer = buffers
                         .get(handle)
                         .context("GpuSurface storage buffer binding missing in DX11 state")?;
                     if buffer.desc.usage != GpuBufferUsage::Storage {
@@ -582,42 +705,39 @@ impl DirectXGpuSurfaceState {
                         .unordered_access_view
                         .clone()
                         .context("GpuSurface storage buffer is not writable on DX11")?;
-                    extra_unordered_access_views.push((layout.slot, view));
+                    self.unordered_access_scratch.push((layout.slot, view));
                 }
                 (
                     GpuBinding::SampledTexture(handle),
                     DirectXGpuSurfaceProgramBindingKind::SampledTexture,
                 ) => {
-                    let view = self
-                        .textures
+                    let view = textures
                         .get(handle)
                         .context("GpuSurface sampled texture binding missing in DX11 state")?
                         .shader_resource_view
                         .clone()
                         .context("GpuSurface sampled texture is not sampleable on DX11")?;
-                    extra_shader_resources.push((layout.slot, view));
+                    self.shader_resource_scratch.push((layout.slot, view));
                 }
                 (
                     GpuBinding::StorageTexture(handle),
                     DirectXGpuSurfaceProgramBindingKind::StorageTexture,
                 ) => {
-                    let view = self
-                        .textures
+                    let view = textures
                         .get(handle)
                         .context("GpuSurface storage texture binding missing in DX11 state")?
                         .unordered_access_view
                         .clone()
                         .context("GpuSurface storage texture is not writable on DX11")?;
-                    extra_unordered_access_views.push((layout.slot, view));
+                    self.unordered_access_scratch.push((layout.slot, view));
                 }
                 (GpuBinding::Sampler(handle), DirectXGpuSurfaceProgramBindingKind::Sampler) => {
-                    let sampler = self
-                        .samplers
+                    let sampler = samplers
                         .get(handle)
                         .context("GpuSurface sampler binding missing in DX11 state")?
                         .sampler
                         .clone();
-                    extra_samplers.push((layout.slot, sampler));
+                    self.sampler_scratch.push((layout.slot, sampler));
                 }
                 _ => {
                     anyhow::bail!("GpuSurface render pass binding type does not match shader");
@@ -632,21 +752,25 @@ impl DirectXGpuSurfaceState {
             } => (vertex_count, instance_count),
         };
         unsafe {
-            if let Some(max_slot) = extra_unordered_access_views
+            if let Some(max_slot) = self
+                .unordered_access_scratch
                 .iter()
                 .map(|(slot, _)| *slot)
                 .max()
             {
-                let mut unordered_access_views = vec![None; max_slot as usize + 1];
-                for (slot, view) in &extra_unordered_access_views {
-                    unordered_access_views[*slot as usize] = Some(view.clone());
+                self.uav_slot_scratch.resize(max_slot as usize + 1, None);
+                for slot in &mut self.uav_slot_scratch {
+                    *slot = None;
+                }
+                for (slot, view) in &self.unordered_access_scratch {
+                    self.uav_slot_scratch[*slot as usize] = Some(view.clone());
                 }
                 device_context.OMSetRenderTargetsAndUnorderedAccessViews(
                     Some(&render_target),
                     None,
                     0,
-                    unordered_access_views.len() as u32,
-                    Some(unordered_access_views.as_ptr()),
+                    self.uav_slot_scratch.len() as u32,
+                    Some(self.uav_slot_scratch.as_ptr()),
                     None,
                 );
             } else {
@@ -654,24 +778,24 @@ impl DirectXGpuSurfaceState {
             }
             device_context.RSSetViewports(Some(std::slice::from_ref(&viewport)));
             device_context.RSSetScissorRects(Some(std::slice::from_ref(&scissor)));
-            device_context.RSSetState(&self.rasterizer_state);
+            device_context.RSSetState(&rasterizer_state);
             device_context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            device_context.VSSetShader(&program.vertex, None);
-            device_context.PSSetShader(&program.fragment, None);
+            device_context.VSSetShader(&vertex_shader, None);
+            device_context.PSSetShader(&fragment_shader, None);
             device_context.VSSetConstantBuffers(0, Some(&frame_uniform_buffer));
             device_context.PSSetConstantBuffers(0, Some(&frame_uniform_buffer));
-            device_context.OMSetBlendState(&self.render_blend_state, None, 0xFFFFFFFF);
-            for (slot, buffer) in &extra_constant_buffers {
+            device_context.OMSetBlendState(&render_blend_state, None, 0xFFFFFFFF);
+            for (slot, buffer) in &self.constant_buffer_scratch {
                 let constant_buffer = [Some(buffer.clone())];
                 device_context.VSSetConstantBuffers(*slot, Some(&constant_buffer));
                 device_context.PSSetConstantBuffers(*slot, Some(&constant_buffer));
             }
-            for (slot, view) in &extra_shader_resources {
+            for (slot, view) in &self.shader_resource_scratch {
                 let shader_resource = [Some(view.clone())];
                 device_context.VSSetShaderResources(*slot, Some(&shader_resource));
                 device_context.PSSetShaderResources(*slot, Some(&shader_resource));
             }
-            for (slot, sampler) in &extra_samplers {
+            for (slot, sampler) in &self.sampler_scratch {
                 let sampler_state = [Some(sampler.clone())];
                 device_context.VSSetSamplers(*slot, Some(&sampler_state));
                 device_context.PSSetSamplers(*slot, Some(&sampler_state));
@@ -681,30 +805,28 @@ impl DirectXGpuSurfaceState {
             let empty_constant_buffer: [Option<ID3D11Buffer>; 1] = [None];
             let empty_shader_resource: [Option<ID3D11ShaderResourceView>; 1] = [None];
             let empty_sampler: [Option<ID3D11SamplerState>; 1] = [None];
-            if let Some(max_slot) = extra_unordered_access_views
-                .iter()
-                .map(|(slot, _)| *slot)
-                .max()
-            {
-                let empty_unordered_access_views = vec![None; max_slot as usize + 1];
+            if !self.uav_slot_scratch.is_empty() {
+                for slot in &mut self.uav_slot_scratch {
+                    *slot = None;
+                }
                 device_context.OMSetRenderTargetsAndUnorderedAccessViews(
                     Some(&render_target),
                     None,
                     0,
-                    empty_unordered_access_views.len() as u32,
-                    Some(empty_unordered_access_views.as_ptr()),
+                    self.uav_slot_scratch.len() as u32,
+                    Some(self.uav_slot_scratch.as_ptr()),
                     None,
                 );
             }
-            for (slot, _) in &extra_constant_buffers {
+            for (slot, _) in &self.constant_buffer_scratch {
                 device_context.VSSetConstantBuffers(*slot, Some(&empty_constant_buffer));
                 device_context.PSSetConstantBuffers(*slot, Some(&empty_constant_buffer));
             }
-            for (slot, _) in &extra_shader_resources {
+            for (slot, _) in &self.shader_resource_scratch {
                 device_context.VSSetShaderResources(*slot, Some(&empty_shader_resource));
                 device_context.PSSetShaderResources(*slot, Some(&empty_shader_resource));
             }
-            for (slot, _) in &extra_samplers {
+            for (slot, _) in &self.sampler_scratch {
                 device_context.VSSetSamplers(*slot, Some(&empty_sampler));
                 device_context.PSSetSamplers(*slot, Some(&empty_sampler));
             }
@@ -715,8 +837,6 @@ impl DirectXGpuSurfaceState {
     fn execute_compute_pass(
         &mut self,
         device_context: &ID3D11DeviceContext,
-        frame: &GpuFrameContext,
-        scale_factor: f32,
         pass: &GpuComputePassDesc,
     ) -> Result<()> {
         if pass.workgroups.contains(&0) {
@@ -736,39 +856,38 @@ impl DirectXGpuSurfaceState {
             );
         }
 
-        let frame_uniform = gpu_surface_frame_uniform(frame, scale_factor);
-        update_buffer(
-            device_context,
-            &self.frame_uniform_buffer,
-            std::slice::from_ref(&frame_uniform),
-        )?;
-
+        let compute_shader = program.compute.clone();
+        let program_bindings = &program.bindings;
         let frame_uniform_buffer = [Some(self.frame_uniform_buffer.clone())];
-        let mut extra_constant_buffers = Vec::new();
-        let mut extra_shader_resources = Vec::new();
-        let mut extra_unordered_access_views = Vec::new();
-        let mut extra_samplers = Vec::new();
-        for (binding, layout) in pass.bindings.iter().zip(program.bindings.iter()) {
+
+        self.constant_buffer_scratch.clear();
+        self.shader_resource_scratch.clear();
+        self.unordered_access_scratch.clear();
+        self.sampler_scratch.clear();
+
+        let buffers = &self.buffers;
+        let textures = &self.textures;
+        let samplers = &self.samplers;
+        for (binding, layout) in pass.bindings.iter().zip(program_bindings.iter()) {
             match (binding, layout.kind) {
                 (
                     GpuBinding::UniformBuffer(handle),
                     DirectXGpuSurfaceProgramBindingKind::UniformBuffer,
                 ) => {
-                    let buffer = self
-                        .buffers
+                    let buffer = buffers
                         .get(handle)
                         .context("GpuSurface uniform buffer binding missing in DX11 state")?;
                     if buffer.desc.usage != GpuBufferUsage::Uniform {
                         anyhow::bail!("GpuSurface uniform binding points to a non-uniform buffer");
                     }
-                    extra_constant_buffers.push((layout.slot, buffer.buffer.clone()));
+                    self.constant_buffer_scratch
+                        .push((layout.slot, buffer.buffer.clone()));
                 }
                 (
                     GpuBinding::StorageBuffer(handle),
                     DirectXGpuSurfaceProgramBindingKind::StorageBufferReadOnly,
                 ) => {
-                    let buffer = self
-                        .buffers
+                    let buffer = buffers
                         .get(handle)
                         .context("GpuSurface storage buffer binding missing in DX11 state")?;
                     if buffer.desc.usage != GpuBufferUsage::Storage {
@@ -778,14 +897,13 @@ impl DirectXGpuSurfaceState {
                         .shader_resource_view
                         .clone()
                         .context("GpuSurface storage buffer is not readable on DX11")?;
-                    extra_shader_resources.push((layout.slot, view));
+                    self.shader_resource_scratch.push((layout.slot, view));
                 }
                 (
                     GpuBinding::StorageBuffer(handle),
                     DirectXGpuSurfaceProgramBindingKind::StorageBufferReadWrite,
                 ) => {
-                    let buffer = self
-                        .buffers
+                    let buffer = buffers
                         .get(handle)
                         .context("GpuSurface storage buffer binding missing in DX11 state")?;
                     if buffer.desc.usage != GpuBufferUsage::Storage {
@@ -795,42 +913,39 @@ impl DirectXGpuSurfaceState {
                         .unordered_access_view
                         .clone()
                         .context("GpuSurface storage buffer is not writable on DX11")?;
-                    extra_unordered_access_views.push((layout.slot, view));
+                    self.unordered_access_scratch.push((layout.slot, view));
                 }
                 (
                     GpuBinding::SampledTexture(handle),
                     DirectXGpuSurfaceProgramBindingKind::SampledTexture,
                 ) => {
-                    let view = self
-                        .textures
+                    let view = textures
                         .get(handle)
                         .context("GpuSurface sampled texture binding missing in DX11 state")?
                         .shader_resource_view
                         .clone()
                         .context("GpuSurface sampled texture is not sampleable on DX11")?;
-                    extra_shader_resources.push((layout.slot, view));
+                    self.shader_resource_scratch.push((layout.slot, view));
                 }
                 (
                     GpuBinding::StorageTexture(handle),
                     DirectXGpuSurfaceProgramBindingKind::StorageTexture,
                 ) => {
-                    let view = self
-                        .textures
+                    let view = textures
                         .get(handle)
                         .context("GpuSurface storage texture binding missing in DX11 state")?
                         .unordered_access_view
                         .clone()
                         .context("GpuSurface storage texture is not writable on DX11")?;
-                    extra_unordered_access_views.push((layout.slot, view));
+                    self.unordered_access_scratch.push((layout.slot, view));
                 }
                 (GpuBinding::Sampler(handle), DirectXGpuSurfaceProgramBindingKind::Sampler) => {
-                    let sampler = self
-                        .samplers
+                    let sampler = samplers
                         .get(handle)
                         .context("GpuSurface sampler binding missing in DX11 state")?
                         .sampler
                         .clone();
-                    extra_samplers.push((layout.slot, sampler));
+                    self.sampler_scratch.push((layout.slot, sampler));
                 }
                 _ => {
                     anyhow::bail!("GpuSurface compute pass binding type does not match shader");
@@ -839,21 +954,21 @@ impl DirectXGpuSurfaceState {
         }
 
         unsafe {
-            device_context.CSSetShader(&program.compute, None);
+            device_context.CSSetShader(&compute_shader, None);
             device_context.CSSetConstantBuffers(0, Some(&frame_uniform_buffer));
-            for (slot, buffer) in &extra_constant_buffers {
+            for (slot, buffer) in &self.constant_buffer_scratch {
                 let constant_buffer = [Some(buffer.clone())];
                 device_context.CSSetConstantBuffers(*slot, Some(&constant_buffer));
             }
-            for (slot, view) in &extra_shader_resources {
+            for (slot, view) in &self.shader_resource_scratch {
                 let shader_resource = [Some(view.clone())];
                 device_context.CSSetShaderResources(*slot, Some(&shader_resource));
             }
-            for (slot, sampler) in &extra_samplers {
+            for (slot, sampler) in &self.sampler_scratch {
                 let sampler_state = [Some(sampler.clone())];
                 device_context.CSSetSamplers(*slot, Some(&sampler_state));
             }
-            for (slot, view) in &extra_unordered_access_views {
+            for (slot, view) in &self.unordered_access_scratch {
                 let unordered_access_view = [Some(view.clone())];
                 device_context.CSSetUnorderedAccessViews(
                     *slot,
@@ -868,16 +983,16 @@ impl DirectXGpuSurfaceState {
             let empty_shader_resource: [Option<ID3D11ShaderResourceView>; 1] = [None];
             let empty_sampler: [Option<ID3D11SamplerState>; 1] = [None];
             let empty_unordered_access_view: [Option<ID3D11UnorderedAccessView>; 1] = [None];
-            for (slot, _) in &extra_constant_buffers {
+            for (slot, _) in &self.constant_buffer_scratch {
                 device_context.CSSetConstantBuffers(*slot, Some(&empty_constant_buffer));
             }
-            for (slot, _) in &extra_shader_resources {
+            for (slot, _) in &self.shader_resource_scratch {
                 device_context.CSSetShaderResources(*slot, Some(&empty_shader_resource));
             }
-            for (slot, _) in &extra_samplers {
+            for (slot, _) in &self.sampler_scratch {
                 device_context.CSSetSamplers(*slot, Some(&empty_sampler));
             }
-            for (slot, _) in &extra_unordered_access_views {
+            for (slot, _) in &self.unordered_access_scratch {
                 device_context.CSSetUnorderedAccessViews(
                     *slot,
                     1,
@@ -948,6 +1063,8 @@ impl DirectXRenderer {
             .context("Creating DirectX global elements")?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectX render pipelines")?;
+        let gpu_surface_sampler = create_gpu_surface_sampler_state(&devices.device)
+            .context("Creating GpuSurface shared sampler")?;
 
         let direct_composition = if disable_direct_composition {
             None
@@ -973,6 +1090,9 @@ impl DirectXRenderer {
             height: 1,
             skip_draws: false,
             gpu_surfaces: HashMap::default(),
+            gpu_surface_sampler,
+            gpu_surface_render_program_cache: HashMap::default(),
+            gpu_surface_compute_program_cache: HashMap::default(),
             frame_serial: 0,
         })
     }
@@ -1062,6 +1182,8 @@ impl DirectXRenderer {
             self.direct_composition.take();
             self.devices.take();
             self.gpu_surfaces.clear();
+            self.gpu_surface_render_program_cache.clear();
+            self.gpu_surface_compute_program_cache.clear();
         }
 
         let devices = DirectXRendererDevices::new(directx_devices, disable_direct_composition)
@@ -1078,6 +1200,8 @@ impl DirectXRenderer {
             .context("Creating DirectXGlobalElements")?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectXRenderPipelines")?;
+        let gpu_surface_sampler = create_gpu_surface_sampler_state(&devices.device)
+            .context("Creating GpuSurface shared sampler")?;
 
         let direct_composition = if disable_direct_composition {
             None
@@ -1100,6 +1224,7 @@ impl DirectXRenderer {
         self.resources = Some(resources);
         self.globals = globals;
         self.pipelines = pipelines;
+        self.gpu_surface_sampler = gpu_surface_sampler;
         self.direct_composition = direct_composition;
         self.skip_draws = true;
         Ok(())
@@ -1991,9 +2116,17 @@ impl DirectXRenderer {
         state.last_used_frame = self.frame_serial + 1;
         state.sync_textures(&devices.device, input.textures)?;
         state.sync_buffers(&devices.device, input.buffers)?;
-        state.sync_samplers(&devices.device, input.samplers)?;
-        state.sync_render_programs(&devices.device, input.render_programs)?;
-        state.sync_compute_programs(&devices.device, input.compute_programs)?;
+        state.sync_samplers(input.samplers, &self.gpu_surface_sampler)?;
+        state.sync_render_programs(
+            &devices.device,
+            input.render_programs,
+            &mut self.gpu_surface_render_program_cache,
+        )?;
+        state.sync_compute_programs(
+            &devices.device,
+            input.compute_programs,
+            &mut self.gpu_surface_compute_program_cache,
+        )?;
         state.execute_graph(
             &devices.device_context,
             frame,
@@ -2916,11 +3049,12 @@ fn create_gpu_surface_buffer(
     device: &ID3D11Device,
     desc: &GpuBufferDesc,
 ) -> Result<DirectXGpuSurfaceBuffer> {
-    let (buffer, shader_resource_view, unordered_access_view) = match desc.usage {
+    let (buffer, shader_resource_view, unordered_access_view, shadow_data) = match desc.usage {
         GpuBufferUsage::Uniform => (
-            create_constant_buffer(device, desc.size as usize)?,
+            create_gpu_surface_uniform_buffer(device, desc)?,
             None,
             None,
+            Some(vec![0; gpu_surface_buffer_byte_width(desc) as usize]),
         ),
         GpuBufferUsage::Storage => {
             let buffer_desc = D3D11_BUFFER_DESC {
@@ -2941,23 +3075,20 @@ fn create_gpu_surface_buffer(
             let unordered_access_view = Some(
                 create_gpu_surface_storage_buffer_unordered_access_view(device, &buffer, desc)?,
             );
-            (buffer, shader_resource_view, unordered_access_view)
+            (buffer, shader_resource_view, unordered_access_view, None)
         }
     };
 
     Ok(DirectXGpuSurfaceBuffer {
         desc: desc.clone(),
         buffer,
-        data: vec![0; gpu_surface_buffer_byte_width(desc) as usize],
         shader_resource_view,
         unordered_access_view,
+        shadow_data,
     })
 }
 
-fn create_gpu_surface_sampler(
-    device: &ID3D11Device,
-    desc: &GpuSamplerDesc,
-) -> Result<DirectXGpuSurfaceSampler> {
+fn create_gpu_surface_sampler_state(device: &ID3D11Device) -> Result<ID3D11SamplerState> {
     let state = unsafe {
         let sampler_desc = D3D11_SAMPLER_DESC {
             Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -2976,10 +3107,7 @@ fn create_gpu_surface_sampler(
         output.unwrap()
     };
 
-    Ok(DirectXGpuSurfaceSampler {
-        desc: desc.clone(),
-        sampler: state,
-    })
+    Ok(state)
 }
 
 fn gpu_surface_buffer_byte_width(desc: &GpuBufferDesc) -> u32 {
@@ -2989,28 +3117,81 @@ fn gpu_surface_buffer_byte_width(desc: &GpuBufferDesc) -> u32 {
     }
 }
 
-fn upload_gpu_surface_buffer(
+fn create_gpu_surface_uniform_buffer(
+    device: &ID3D11Device,
+    desc: &GpuBufferDesc,
+) -> Result<ID3D11Buffer> {
+    let buffer_desc = D3D11_BUFFER_DESC {
+        ByteWidth: gpu_surface_buffer_byte_width(desc),
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+        CPUAccessFlags: 0,
+        ..Default::default()
+    };
+    let mut output = None;
+    unsafe { device.CreateBuffer(&buffer_desc, None, Some(&mut output))? };
+    Ok(output.expect("DX11 GpuSurface uniform buffer creation should populate the buffer"))
+}
+
+fn upload_gpu_surface_buffer_write(
     device_context: &ID3D11DeviceContext,
-    buffer: &DirectXGpuSurfaceBuffer,
+    buffer: &mut DirectXGpuSurfaceBuffer,
+    offset: u64,
+    data: &[u8],
 ) -> Result<()> {
-    match buffer.desc.usage {
-        GpuBufferUsage::Uniform => {
-            update_buffer(device_context, &buffer.buffer, buffer.data.as_slice())
-        }
-        GpuBufferUsage::Storage => {
-            unsafe {
+    let end = offset.saturating_add(data.len() as u64);
+    if end > gpu_surface_buffer_byte_width(&buffer.desc) as u64 {
+        anyhow::bail!(
+            "GpuSurface buffer write exceeds GPU allocation bounds on DX11 execution: offset {}, size {}, capacity {}",
+            offset,
+            data.len(),
+            gpu_surface_buffer_byte_width(&buffer.desc)
+        );
+    }
+
+    unsafe {
+        match buffer.desc.usage {
+            GpuBufferUsage::Uniform => {
+                let shadow = buffer.shadow_data.as_mut().context(
+                    "DX11 GpuSurface uniform buffer missing CPU shadow storage for upload",
+                )?;
+                let offset = usize::try_from(offset)
+                    .context("GpuSurface uniform buffer write offset exceeds host range")?;
+                let end = offset + data.len();
+                shadow[offset..end].copy_from_slice(data);
                 device_context.UpdateSubresource(
                     &buffer.buffer,
                     0,
                     None,
-                    buffer.data.as_ptr() as _,
+                    shadow.as_ptr() as _,
                     0,
                     0,
                 );
             }
-            Ok(())
+            GpuBufferUsage::Storage => {
+                let range = D3D11_BOX {
+                    left: u32::try_from(offset)
+                        .context("GpuSurface buffer write offset exceeds DX11 range")?,
+                    right: u32::try_from(end)
+                        .context("GpuSurface buffer write end exceeds DX11 range")?,
+                    top: 0,
+                    bottom: 1,
+                    front: 0,
+                    back: 1,
+                };
+                device_context.UpdateSubresource(
+                    &buffer.buffer,
+                    0,
+                    Some(&range),
+                    data.as_ptr() as _,
+                    0,
+                    0,
+                );
+            }
         }
     }
+
+    Ok(())
 }
 
 fn create_gpu_surface_storage_buffer_shader_resource_view(
@@ -3967,6 +4148,29 @@ mod tests {
         assert_eq!(pool.len(), 1);
         assert_eq!(pool.take(&base), Some(11));
         assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn gpu_surface_texture_pool_respects_byte_budget() {
+        let mut pool = DirectXGpuSurfaceTexturePool::default();
+        let desc = GpuTextureDesc {
+            extent: GpuExtent {
+                width: 4096,
+                height: 4096,
+            },
+            format: GpuTextureFormat::Rgba32Float,
+            sampled: true,
+            storage: false,
+            render_attachment: true,
+            copy_src: false,
+            copy_dst: false,
+            ..GpuTextureDesc::default()
+        };
+
+        pool.recycle((&desc).into(), 1u32);
+
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.take(&desc), None);
     }
 
     #[test]
