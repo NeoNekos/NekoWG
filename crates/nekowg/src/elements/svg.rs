@@ -117,22 +117,8 @@ impl Element for Svg {
             cx,
             |style, window, cx| {
                 if let Some((path, color)) = self.path.as_ref().zip(style.text.color) {
-                    let transformation = self
-                        .transformation
-                        .as_ref()
-                        .map(|transformation| {
-                            transformation.into_matrix(bounds.center(), window.scale_factor())
-                        })
-                        .unwrap_or_default();
-
-                    window
-                        .paint_svg(bounds, path.clone(), None, transformation, color, cx)
-                        .log_err();
-                } else if let Some((path, color)) =
-                    self.external_path.as_ref().zip(style.text.color)
-                {
-                    let Some(bytes) = window
-                        .use_asset::<SvgAsset>(path, cx)
+                    let Some(document) = window
+                        .use_asset::<BundledSvgDocumentAsset>(path, cx)
                         .and_then(|asset| asset.log_err())
                     else {
                         return;
@@ -147,10 +133,38 @@ impl Element for Svg {
                         .unwrap_or_default();
 
                     window
-                        .paint_svg(
+                        .paint_svg_document(
                             bounds,
                             path.clone(),
-                            Some(&bytes),
+                            &document,
+                            transformation,
+                            color,
+                            cx,
+                        )
+                        .log_err();
+                } else if let Some((path, color)) =
+                    self.external_path.as_ref().zip(style.text.color)
+                {
+                    let Some(document) = window
+                        .use_asset::<ParsedSvgAsset>(path, cx)
+                        .and_then(|asset| asset.log_err())
+                    else {
+                        return;
+                    };
+
+                    let transformation = self
+                        .transformation
+                        .as_ref()
+                        .map(|transformation| {
+                            transformation.into_matrix(bounds.center(), window.scale_factor())
+                        })
+                        .unwrap_or_default();
+
+                    window
+                        .paint_svg_document(
+                            bounds,
+                            path.clone(),
+                            &document,
                             transformation,
                             color,
                             cx,
@@ -257,20 +271,45 @@ impl Transformation {
     }
 }
 
-enum SvgAsset {}
+enum ParsedSvgAsset {}
 
-impl Asset for SvgAsset {
+enum BundledSvgDocumentAsset {}
+
+impl Asset for BundledSvgDocumentAsset {
     type Source = SharedString;
-    type Output = Result<Arc<[u8]>, Arc<std::io::Error>>;
+    type Output = Result<Arc<crate::ParsedSvgDocument>, Arc<anyhow::Error>>;
 
     fn load(
         source: Self::Source,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> impl Future<Output = Self::Output> + Send + 'static {
+        let svg_renderer = cx.svg_renderer();
         async move {
-            let bytes = fs::read(Path::new(source.as_ref())).map_err(|e| Arc::new(e))?;
-            let bytes = Arc::from(bytes);
-            Ok(bytes)
+            svg_renderer
+                .load_document(source.as_ref())
+                .and_then(|document| document.ok_or_else(|| anyhow::anyhow!("SVG asset not found")))
+                .map_err(Arc::new)
+        }
+    }
+}
+
+impl Asset for ParsedSvgAsset {
+    type Source = SharedString;
+    type Output = Result<Arc<crate::ParsedSvgDocument>, Arc<anyhow::Error>>;
+
+    fn load(
+        source: Self::Source,
+        cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        let svg_renderer = cx.svg_renderer();
+        async move {
+            let bytes = fs::read(Path::new(source.as_ref()))
+                .map_err(anyhow::Error::from)
+                .map_err(Arc::new)?;
+            svg_renderer
+                .parse_document(&bytes)
+                .map_err(anyhow::Error::from)
+                .map_err(Arc::new)
         }
     }
 }

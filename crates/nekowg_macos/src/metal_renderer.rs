@@ -855,6 +855,10 @@ impl MetalRenderer {
             .retain(|_, state| state.last_used_frame >= min_frame);
     }
 
+    pub(crate) fn release_gpu_surface(&mut self, surface_id: u64) {
+        self.gpu_surfaces.remove(&surface_id);
+    }
+
     pub(crate) fn paint_gpu_surface(
         &mut self,
         input: GpuSurfaceExecutionInput<'_>,

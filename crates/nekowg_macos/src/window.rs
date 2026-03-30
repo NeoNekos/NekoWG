@@ -1582,6 +1582,10 @@ impl PlatformWindow for MacWindow {
             .flatten()
     }
 
+    fn release_gpu_surface(&self, surface_id: u64) {
+        self.0.lock().renderer.release_gpu_surface(surface_id);
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }

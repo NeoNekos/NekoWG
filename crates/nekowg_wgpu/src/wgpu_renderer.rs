@@ -1896,6 +1896,10 @@ impl WgpuRenderer {
             .retain(|_, state| state.last_used_frame >= min_frame);
     }
 
+    pub fn release_gpu_surface(&mut self, surface_id: u64) {
+        self.gpu_surfaces.remove(&surface_id);
+    }
+
     pub fn paint_gpu_surface(
         &mut self,
         input: GpuSurfaceExecutionInput<'_>,

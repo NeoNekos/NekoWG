@@ -19,7 +19,7 @@ use crate::{
     TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    hash, point, prelude::*, px, rems, size, transparent_black,
+    hash, point, prelude::*, px, quantize_svg_raster_size, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -742,6 +742,7 @@ pub(crate) struct Frame {
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
     pub(crate) assets_by_view: FxHashMap<EntityId, FxHashSet<(TypeId, u64)>>,
+    pub(crate) gpu_surface_ids: Vec<u64>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
@@ -773,6 +774,7 @@ pub(crate) struct PrepaintStateIndex {
 #[derive(Clone, Default)]
 pub(crate) struct PaintIndex {
     scene_index: usize,
+    gpu_surface_ids_index: usize,
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
@@ -789,6 +791,7 @@ impl Frame {
             element_states: FxHashMap::default(),
             accessed_element_states: Vec::new(),
             assets_by_view: FxHashMap::default(),
+            gpu_surface_ids: Vec::new(),
             mouse_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
@@ -815,6 +818,7 @@ impl Frame {
         self.element_states.clear();
         self.accessed_element_states.clear();
         self.assets_by_view.clear();
+        self.gpu_surface_ids.clear();
         self.mouse_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
@@ -2285,6 +2289,12 @@ impl Window {
             &self.rendered_frame.assets_by_view,
             &self.next_frame.assets_by_view,
         );
+        for surface_id in released_gpu_surface_ids(
+            &self.rendered_frame.gpu_surface_ids,
+            &self.next_frame.gpu_surface_ids,
+        ) {
+            self.platform_window.release_gpu_surface(surface_id);
+        }
         self.sprite_atlas.end_frame();
         self.atlas_removed_keys.clear();
         self.sprite_atlas
@@ -2656,6 +2666,7 @@ impl Window {
     pub(crate) fn paint_index(&self) -> PaintIndex {
         PaintIndex {
             scene_index: self.next_frame.scene.len(),
+            gpu_surface_ids_index: self.next_frame.gpu_surface_ids.len(),
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
@@ -2666,6 +2677,12 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        self.next_frame.gpu_surface_ids.extend(
+            self.rendered_frame.gpu_surface_ids
+                [range.start.gpu_surface_ids_index..range.end.gpu_surface_ids_index]
+                .iter()
+                .copied(),
+        );
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -3590,15 +3607,79 @@ impl Window {
         let bounds = bounds.scale(scale_factor);
         let params = RenderSvgParams {
             path,
-            size: bounds.size.map(|pixels| {
+            size: quantize_svg_raster_size(bounds.size.map(|pixels| {
                 DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32)
-            }),
+            })),
         };
 
         let Some(tile) =
             self.sprite_atlas
                 .get_or_insert_with(&params.clone().into(), &mut || {
                     let Some((size, bytes)) = cx.svg_renderer.render_alpha_mask(&params, data)?
+                    else {
+                        return Ok(None);
+                    };
+                    Ok(Some((size, Cow::Owned(bytes))))
+                })?
+        else {
+            return Ok(());
+        };
+        let content_mask = self.content_mask().scale(scale_factor);
+        let svg_bounds = Bounds {
+            origin: bounds.center()
+                - Point::new(
+                    ScaledPixels(tile.bounds.size.width.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
+                    ScaledPixels(tile.bounds.size.height.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
+                ),
+            size: tile
+                .bounds
+                .size
+                .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
+        };
+
+        self.next_frame.scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: svg_bounds
+                .map_origin(|origin| origin.round())
+                .map_size(|size| size.ceil()),
+            content_mask,
+            color: color.opacity(element_opacity),
+            tile,
+            transformation,
+        });
+
+        Ok(())
+    }
+
+    pub(crate) fn paint_svg_document(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        path: SharedString,
+        document: &crate::ParsedSvgDocument,
+        transformation: TransformationMatrix,
+        color: Hsla,
+        cx: &App,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let element_opacity = self.element_opacity();
+        let scale_factor = self.scale_factor();
+
+        let bounds = bounds.scale(scale_factor);
+        let params = RenderSvgParams {
+            path,
+            size: quantize_svg_raster_size(bounds.size.map(|pixels| {
+                DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32)
+            })),
+        };
+
+        let Some(tile) =
+            self.sprite_atlas
+                .get_or_insert_with(&params.clone().into(), &mut || {
+                    let Some((size, bytes)) = cx
+                        .svg_renderer
+                        .render_alpha_mask_from_document(&params, document)?
                     else {
                         return Ok(None);
                     };
@@ -3754,6 +3835,7 @@ impl Window {
         };
 
         if let Some(surface) = self.platform_window.paint_gpu_surface(input) {
+            self.next_frame.gpu_surface_ids.push(surface_id);
             self.next_frame.scene.insert_primitive(surface);
         }
     }
@@ -5570,6 +5652,31 @@ impl Display for ElementId {
         }
 
         Ok(())
+    }
+}
+
+fn released_gpu_surface_ids(previous: &[u64], current: &[u64]) -> Vec<u64> {
+    let current_ids = current.iter().copied().collect::<FxHashSet<_>>();
+    let mut released = Vec::new();
+    for surface_id in previous.iter().copied().collect::<FxHashSet<_>>() {
+        if !current_ids.contains(&surface_id) {
+            released.push(surface_id);
+        }
+    }
+    released
+}
+
+#[cfg(test)]
+mod tests {
+    use super::released_gpu_surface_ids;
+
+    #[test]
+    fn gpu_surface_release_diff_ignores_still_live_and_duplicate_ids() {
+        let released = released_gpu_surface_ids(&[1, 2, 2, 3], &[2, 4, 4]);
+
+        assert_eq!(released.len(), 2);
+        assert!(released.contains(&1));
+        assert!(released.contains(&3));
     }
 }
 

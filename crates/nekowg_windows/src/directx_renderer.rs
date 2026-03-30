@@ -2198,6 +2198,19 @@ impl DirectXRenderer {
         self.gpu_surfaces
             .retain(|_, state| state.last_used_frame >= frame_serial);
     }
+
+    pub(crate) fn release_gpu_surface(&mut self, surface_id: u64) {
+        self.gpu_surfaces.remove(&surface_id);
+        prune_unreferenced_gpu_surface_programs(&mut self.gpu_surface_render_program_cache);
+        prune_unreferenced_gpu_surface_programs(&mut self.gpu_surface_compute_program_cache);
+    }
+}
+
+fn prune_unreferenced_gpu_surface_programs<K, T>(cache: &mut HashMap<K, Arc<T>>)
+where
+    K: Eq + std::hash::Hash,
+{
+    cache.retain(|_, program| Arc::strong_count(program) > 1);
 }
 
 impl DirectXResources {
@@ -4086,9 +4099,11 @@ mod tests {
     use super::{
         DirectXGpuSurfaceProgramBinding, DirectXGpuSurfaceProgramBindingKind,
         DirectXGpuSurfaceTexturePool, GpuSurfaceHlslSamplerBinding,
-        rewrite_gpu_surface_hlsl_sampler_bindings, validate_gpu_surface_render_program_stages,
+        prune_unreferenced_gpu_surface_programs, rewrite_gpu_surface_hlsl_sampler_bindings,
+        validate_gpu_surface_render_program_stages,
     };
     use nekowg::{GpuExtent, GpuTextureDesc, GpuTextureFormat};
+    use std::{collections::HashMap, sync::Arc};
 
     #[test]
     fn gpu_surface_texture_pool_reuses_matching_desc_ignoring_labels() {
@@ -4171,6 +4186,19 @@ mod tests {
 
         assert_eq!(pool.len(), 0);
         assert_eq!(pool.take(&desc), None);
+    }
+
+    #[test]
+    fn gpu_surface_program_cache_drops_entries_without_surface_owners() {
+        let kept = Arc::new(7u32);
+        let surface_owner = kept.clone();
+        let mut cache = HashMap::from([(1u32, Arc::new(1u32)), (2u32, kept)]);
+
+        prune_unreferenced_gpu_surface_programs(&mut cache);
+
+        assert!(!cache.contains_key(&1));
+        assert!(cache.contains_key(&2));
+        drop(surface_owner);
     }
 
     #[test]

@@ -545,6 +545,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn paint_gpu_surface(&self, _input: GpuSurfaceExecutionInput<'_>) -> Option<PaintSurface> {
         None
     }
+    #[doc(hidden)]
+    fn release_gpu_surface(&self, _surface_id: u64) {}
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 

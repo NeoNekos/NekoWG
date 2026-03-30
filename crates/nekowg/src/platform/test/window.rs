@@ -29,6 +29,7 @@ pub(crate) struct TestWindowState {
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
+    released_gpu_surface_ids: Vec<u64>,
     is_fullscreen: bool,
     visible: bool,
 }
@@ -75,6 +76,7 @@ impl TestWindow {
             resize_callback: None,
             moved_callback: None,
             input_handler: None,
+            released_gpu_surface_ids: Vec::new(),
             is_fullscreen: false,
             visible: true,
         })))
@@ -286,6 +288,10 @@ impl PlatformWindow for TestWindow {
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
     fn draw(&self, _scene: &crate::Scene) {}
+
+    fn release_gpu_surface(&self, surface_id: u64) {
+        self.0.lock().released_gpu_surface_ids.push(surface_id);
+    }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
         self.0.lock().sprite_atlas.clone()

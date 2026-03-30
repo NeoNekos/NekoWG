@@ -949,6 +949,13 @@ impl PlatformWindow for WindowsWindow {
             .flatten()
     }
 
+    fn release_gpu_surface(&self, surface_id: u64) {
+        self.state
+            .renderer
+            .borrow_mut()
+            .release_gpu_surface(surface_id);
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.state.renderer.borrow().sprite_atlas()
     }

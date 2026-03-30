@@ -1411,6 +1411,10 @@ impl PlatformWindow for WaylandWindow {
             .flatten()
     }
 
+    fn release_gpu_surface(&self, surface_id: u64) {
+        self.borrow_mut().renderer.release_gpu_surface(surface_id);
+    }
+
     fn completed_frame(&self) {
         let state = self.borrow();
         if !state.visible {
