@@ -95,7 +95,7 @@ x11rb::atom_manager! {
 }
 
 thread_local! {
-    static ATOM_NAME_CACHE: RefCell<HashMap<Atom, &'static str>> = Default::default();
+    static ATOM_NAME_CACHE: RefCell<HashMap<Atom, String>> = Default::default();
 }
 
 // Some clipboard items, like images, may take a very long time to produce a
@@ -513,17 +513,16 @@ impl Inner {
         .map_err(into_unknown)
     }
 
-    fn atom_name(&self, atom: x11rb::protocol::xproto::Atom) -> &'static str {
+    fn atom_name(&self, atom: x11rb::protocol::xproto::Atom) -> String {
         ATOM_NAME_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             match cache.entry(atom) {
-                Entry::Occupied(entry) => *entry.get(),
+                Entry::Occupied(entry) => entry.get().clone(),
                 Entry::Vacant(entry) => {
                     let s = self
                         .query_atom_name(atom)
-                        .map(|s| Box::leak(s.into_boxed_str()) as &str)
-                        .unwrap_or("FAILED-TO-GET-THE-ATOM-NAME");
-                    entry.insert(s);
+                        .unwrap_or_else(|_| "FAILED-TO-GET-THE-ATOM-NAME".to_string());
+                    entry.insert(s.clone());
                     s
                 }
             }

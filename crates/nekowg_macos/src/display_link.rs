@@ -3,12 +3,31 @@ use core_graphics::display::CGDirectDisplayID;
 use dispatch2::{
     _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained, DispatchSource,
 };
-use std::ffi::c_void;
+use std::{
+    ffi::c_void,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 use util::ResultExt;
 
 pub struct DisplayLink {
     display_link: Option<sys::DisplayLink>,
     frame_requests: DispatchRetained<DispatchSource>,
+    callback_context: *const CallbackContext,
+    running: bool,
+}
+
+struct CallbackContext {
+    frame_requests: DispatchRetained<DispatchSource>,
+    state: AtomicU8,
+}
+
+impl CallbackContext {
+    const RUNNING: u8 = 0;
+    const SHUTDOWN_REQUESTED: u8 = 1;
+    const RELEASED: u8 = 2;
 }
 
 impl DisplayLink {
@@ -18,16 +37,33 @@ impl DisplayLink {
         callback: extern "C" fn(*mut c_void),
     ) -> Result<DisplayLink> {
         unsafe extern "C" fn display_link_callback(
-            _display_link_out: *mut sys::CVDisplayLink,
+            display_link_out: *mut sys::CVDisplayLink,
             _current_time: *const sys::CVTimeStamp,
             _output_time: *const sys::CVTimeStamp,
             _flags_in: i64,
             _flags_out: *mut i64,
-            frame_requests: *mut c_void,
+            callback_context: *mut c_void,
         ) -> i32 {
             unsafe {
-                let frame_requests = &*(frame_requests as *const DispatchSource);
-                frame_requests.merge_data(1);
+                let callback_context = &*(callback_context as *const CallbackContext);
+                if callback_context
+                    .state
+                    .compare_exchange(
+                        CallbackContext::SHUTDOWN_REQUESTED,
+                        CallbackContext::RELEASED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    let display_link = &mut *(display_link_out as *mut sys::DisplayLinkRef);
+                    let _ = sys::CVDisplayLinkStop(display_link);
+                    sys::CVDisplayLinkRelease(display_link_out);
+                    drop(Arc::from_raw(callback_context as *const CallbackContext));
+                    return 0;
+                }
+
+                callback_context.frame_requests.merge_data(1);
                 0
             }
         }
@@ -42,16 +78,23 @@ impl DisplayLink {
             frame_requests.set_context(data);
             frame_requests.set_event_handler_f(callback);
             frame_requests.resume();
+            let callback_context = Arc::new(CallbackContext {
+                frame_requests: frame_requests.clone(),
+                state: AtomicU8::new(CallbackContext::RUNNING),
+            });
+            let callback_context = Arc::into_raw(callback_context);
 
             let display_link = sys::DisplayLink::new(
                 display_id,
                 display_link_callback,
-                &*frame_requests as *const DispatchSource as *mut c_void,
+                callback_context as *mut c_void,
             )?;
 
             Ok(Self {
                 display_link: Some(display_link),
                 frame_requests,
+                callback_context,
+                running: false,
             })
         }
     }
@@ -60,6 +103,7 @@ impl DisplayLink {
         unsafe {
             self.display_link.as_mut().unwrap().start()?;
         }
+        self.running = true;
         Ok(())
     }
 
@@ -67,21 +111,26 @@ impl DisplayLink {
         unsafe {
             self.display_link.as_mut().unwrap().stop()?;
         }
+        self.running = false;
         Ok(())
     }
 }
 
 impl Drop for DisplayLink {
     fn drop(&mut self) {
-        self.stop().log_err();
-        // We see occasional segfaults on the CVDisplayLink thread.
-        //
-        // It seems possible that this happens because CVDisplayLinkRelease releases the CVDisplayLink
-        // on the main thread immediately, but the background thread that CVDisplayLink uses for timers
-        // is still accessing it.
-        //
-        // We might also want to upgrade to CADisplayLink, but that requires dropping old macOS support.
-        std::mem::forget(self.display_link.take());
+        if self.running {
+            unsafe {
+                (*self.callback_context)
+                    .state
+                    .store(CallbackContext::SHUTDOWN_REQUESTED, Ordering::Release);
+            }
+            std::mem::forget(self.display_link.take());
+        } else {
+            self.stop().log_err();
+            unsafe {
+                drop(Arc::from_raw(self.callback_context));
+            }
+        }
         self.frame_requests.cancel();
     }
 }

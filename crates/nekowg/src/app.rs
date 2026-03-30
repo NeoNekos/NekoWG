@@ -61,6 +61,13 @@ mod visual_test_context;
 /// The duration for which futures returned from [Context::on_app_quit] can run before the application fully quits.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 
+pub(crate) type AssetKey = (TypeId, u64);
+
+struct InflightAssetEntry {
+    generation: u64,
+    task: Box<dyn Any>,
+}
+
 /// Temporary(?) wrapper around [`RefCell<App>`] to help us debug any double borrows.
 /// Strongly consider removing after stabilization.
 #[doc(hidden)]
@@ -579,7 +586,11 @@ pub struct App {
     pub(crate) active_drag: Option<AnyDrag>,
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
-    pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
+    inflight_assets: FxHashMap<AssetKey, InflightAssetEntry>,
+    cached_assets: FxHashMap<AssetKey, Box<dyn Any>>,
+    view_owned_assets: FxHashMap<AssetKey, Box<dyn Any>>,
+    view_asset_ref_counts: FxHashMap<AssetKey, usize>,
+    next_inflight_asset_generation: u64,
     asset_source: Arc<dyn AssetSource>,
     pub(crate) svg_renderer: SvgRenderer,
     http_client: Arc<dyn HttpClient>,
@@ -666,7 +677,11 @@ impl App {
                 background_executor,
                 foreground_executor,
                 svg_renderer: SvgRenderer::new(asset_source.clone()),
-                loading_assets: Default::default(),
+                inflight_assets: Default::default(),
+                cached_assets: Default::default(),
+                view_owned_assets: Default::default(),
+                view_asset_ref_counts: Default::default(),
+                next_inflight_asset_generation: 1,
                 asset_source,
                 http_client,
                 globals_by_type: FxHashMap::default(),
@@ -1526,6 +1541,7 @@ impl App {
                 cx.window_update_stack.pop();
 
                 if window.removed {
+                    cx.release_view_asset_usage(&window.rendered_frame.assets_by_view);
                     cx.window_handles.remove(&id);
                     cx.windows.remove(id);
 
@@ -2200,31 +2216,229 @@ impl App {
 
     /// Remove an asset from NekoWG's cache
     pub fn remove_asset<A: Asset>(&mut self, source: &A::Source) {
-        let asset_id = (TypeId::of::<A>(), hash(source));
-        self.loading_assets.remove(&asset_id);
+        let asset_id = Self::asset_key::<A>(source);
+        self.inflight_assets.remove(&asset_id);
+        self.cached_assets.remove(&asset_id);
+        self.view_owned_assets.remove(&asset_id);
+        self.view_asset_ref_counts.remove(&asset_id);
     }
 
-    /// Asynchronously load an asset, if the asset hasn't finished loading this will return None.
+    /// Asynchronously load an asset into the app-global persistent cache.
     ///
     /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
-    /// time, and the results of this call will be cached
+    /// time, and the results of this call will remain cached until `remove_asset` is called.
     pub fn fetch_asset<A: Asset>(&mut self, source: &A::Source) -> (Shared<Task<A::Output>>, bool) {
-        let asset_id = (TypeId::of::<A>(), hash(source));
-        let mut is_first = false;
-        let task = self
-            .loading_assets
+        self.fetch_cached_asset::<A>(source)
+    }
+
+    /// Asynchronously load an asset into the app-global persistent cache.
+    pub fn fetch_cached_asset<A: Asset>(
+        &mut self,
+        source: &A::Source,
+    ) -> (Shared<Task<A::Output>>, bool) {
+        let asset_id = Self::asset_key::<A>(source);
+        if let Some(task) = Self::take_registered_asset_task::<A>(&mut self.cached_assets, asset_id)
+        {
+            Self::insert_registered_asset_task::<A>(&mut self.cached_assets, asset_id, &task);
+            return (task, false);
+        }
+
+        let (task, is_first) = self.fetch_shared_asset_task::<A>(source, asset_id);
+        Self::insert_registered_asset_task::<A>(&mut self.cached_assets, asset_id, &task);
+        (task, is_first)
+    }
+
+    pub(crate) fn fetch_view_asset<A: Asset>(
+        &mut self,
+        source: &A::Source,
+    ) -> (Shared<Task<A::Output>>, bool) {
+        let asset_id = Self::asset_key::<A>(source);
+        if let Some(task) =
+            Self::take_registered_asset_task::<A>(&mut self.view_owned_assets, asset_id)
+        {
+            Self::insert_registered_asset_task::<A>(&mut self.view_owned_assets, asset_id, &task);
+            return (task, false);
+        }
+
+        let (task, is_first) = self.fetch_shared_asset_task::<A>(source, asset_id);
+        Self::insert_registered_asset_task::<A>(&mut self.view_owned_assets, asset_id, &task);
+        (task, is_first)
+    }
+
+    fn asset_key<A: Asset>(source: &A::Source) -> AssetKey {
+        (TypeId::of::<A>(), hash(source))
+    }
+
+    fn take_registered_asset_task<A: Asset>(
+        registry: &mut FxHashMap<AssetKey, Box<dyn Any>>,
+        asset_id: AssetKey,
+    ) -> Option<Shared<Task<A::Output>>> {
+        registry
             .remove(&asset_id)
             .map(|boxed_task| *boxed_task.downcast::<Shared<Task<A::Output>>>().unwrap())
-            .unwrap_or_else(|| {
-                is_first = true;
-                let future = A::load(source.clone(), self);
+    }
 
-                self.background_executor().spawn(future).shared()
-            });
+    fn insert_registered_asset_task<A: Asset>(
+        registry: &mut FxHashMap<AssetKey, Box<dyn Any>>,
+        asset_id: AssetKey,
+        task: &Shared<Task<A::Output>>,
+    ) {
+        registry.insert(asset_id, Box::new(task.clone()));
+    }
 
-        self.loading_assets.insert(asset_id, Box::new(task.clone()));
+    fn take_inflight_asset_task<A: Asset>(
+        &mut self,
+        asset_id: AssetKey,
+    ) -> Option<(Shared<Task<A::Output>>, u64)> {
+        self.inflight_assets.remove(&asset_id).map(|entry| {
+            (
+                *entry.task.downcast::<Shared<Task<A::Output>>>().unwrap(),
+                entry.generation,
+            )
+        })
+    }
 
-        (task, is_first)
+    fn insert_inflight_asset_task<A: Asset>(
+        &mut self,
+        asset_id: AssetKey,
+        generation: u64,
+        task: &Shared<Task<A::Output>>,
+    ) {
+        self.inflight_assets.insert(
+            asset_id,
+            InflightAssetEntry {
+                generation,
+                task: Box::new(task.clone()),
+            },
+        );
+    }
+
+    fn next_inflight_asset_generation(&mut self) -> u64 {
+        let generation = self.next_inflight_asset_generation;
+        self.next_inflight_asset_generation =
+            self.next_inflight_asset_generation.wrapping_add(1).max(1);
+        generation
+    }
+
+    fn finish_inflight_asset_load(&mut self, asset_id: AssetKey, generation: u64) {
+        if self
+            .inflight_assets
+            .get(&asset_id)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            self.inflight_assets.remove(&asset_id);
+        }
+    }
+
+    fn spawn_inflight_asset_cleanup<A: Asset>(
+        &self,
+        asset_id: AssetKey,
+        generation: u64,
+        task: Shared<Task<A::Output>>,
+    ) {
+        let async_app = self.to_async();
+        let foreground_executor = self.foreground_executor.clone();
+        foreground_executor
+            .spawn(async move {
+                task.await;
+                async_app
+                    .update(|cx: &mut App| cx.finish_inflight_asset_load(asset_id, generation));
+            })
+            .detach();
+    }
+
+    fn fetch_shared_asset_task<A: Asset>(
+        &mut self,
+        source: &A::Source,
+        asset_id: AssetKey,
+    ) -> (Shared<Task<A::Output>>, bool) {
+        if let Some(task) = Self::take_registered_asset_task::<A>(&mut self.cached_assets, asset_id)
+        {
+            Self::insert_registered_asset_task::<A>(&mut self.cached_assets, asset_id, &task);
+            return (task, false);
+        }
+
+        if let Some(task) =
+            Self::take_registered_asset_task::<A>(&mut self.view_owned_assets, asset_id)
+        {
+            Self::insert_registered_asset_task::<A>(&mut self.view_owned_assets, asset_id, &task);
+            return (task, false);
+        }
+
+        if let Some((task, generation)) = self.take_inflight_asset_task::<A>(asset_id) {
+            self.insert_inflight_asset_task::<A>(asset_id, generation, &task);
+            return (task, false);
+        }
+
+        let background_executor = self.background_executor.clone();
+        let task = background_executor
+            .spawn(A::load(source.clone(), self))
+            .shared();
+        let generation = self.next_inflight_asset_generation();
+        self.insert_inflight_asset_task::<A>(asset_id, generation, &task);
+        self.spawn_inflight_asset_cleanup::<A>(asset_id, generation, task.clone());
+        (task, true)
+    }
+
+    fn retain_view_asset(&mut self, asset_id: AssetKey) {
+        *self.view_asset_ref_counts.entry(asset_id).or_default() += 1;
+    }
+
+    fn release_view_asset(&mut self, asset_id: AssetKey) {
+        let Some(ref_count) = self.view_asset_ref_counts.get_mut(&asset_id) else {
+            return;
+        };
+
+        *ref_count = ref_count.saturating_sub(1);
+        if *ref_count == 0 {
+            self.view_asset_ref_counts.remove(&asset_id);
+            self.view_owned_assets.remove(&asset_id);
+        }
+    }
+
+    pub(crate) fn sync_view_asset_usage(
+        &mut self,
+        previous: &FxHashMap<EntityId, FxHashSet<AssetKey>>,
+        current: &FxHashMap<EntityId, FxHashSet<AssetKey>>,
+    ) {
+        for (view_id, previous_assets) in previous {
+            if let Some(current_assets) = current.get(view_id) {
+                for asset_id in previous_assets {
+                    if !current_assets.contains(asset_id) {
+                        self.release_view_asset(*asset_id);
+                    }
+                }
+            } else {
+                for asset_id in previous_assets {
+                    self.release_view_asset(*asset_id);
+                }
+            }
+        }
+
+        for (view_id, current_assets) in current {
+            if let Some(previous_assets) = previous.get(view_id) {
+                for asset_id in current_assets {
+                    if !previous_assets.contains(asset_id) {
+                        self.retain_view_asset(*asset_id);
+                    }
+                }
+            } else {
+                for asset_id in current_assets {
+                    self.retain_view_asset(*asset_id);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn release_view_asset_usage(
+        &mut self,
+        assets_by_view: &FxHashMap<EntityId, FxHashSet<AssetKey>>,
+    ) {
+        for assets in assets_by_view.values() {
+            for asset_id in assets {
+                self.release_view_asset(*asset_id);
+            }
+        }
     }
 
     /// Obtain a new [`FocusHandle`], which allows you to track and manipulate the keyboard focus
@@ -2618,9 +2832,38 @@ impl<'a, T> Drop for NekowgBorrow<'a, T> {
 
 #[cfg(test)]
 mod test {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering::SeqCst},
+        },
+    };
 
-    use crate::{AppContext, TestAppContext};
+    use collections::{FxHashMap, FxHashSet};
+
+    use super::{App, AssetKey, hash};
+    use crate::{AppContext, Asset, EntityId, TestAppContext};
+
+    static TEST_ASSET_LOADS: AtomicUsize = AtomicUsize::new(0);
+    static TEST_ASSET_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[derive(Clone)]
+    struct TestAsset;
+
+    impl Asset for TestAsset {
+        type Source = u64;
+        type Output = u64;
+
+        fn load(
+            source: Self::Source,
+            _cx: &mut App,
+        ) -> impl Future<Output = Self::Output> + Send + 'static {
+            TEST_ASSET_LOADS.fetch_add(1, SeqCst);
+            async move { source * 2 }
+        }
+    }
 
     #[test]
     fn test_nekowg_borrow() {
@@ -2651,5 +2894,69 @@ mod test {
         });
 
         assert_eq!(*observation_count.borrow(), 2);
+    }
+
+    #[test]
+    fn view_owned_assets_release_when_view_usage_ends() {
+        let _guard = TEST_ASSET_TEST_LOCK.lock().unwrap();
+        TEST_ASSET_LOADS.store(0, SeqCst);
+
+        let cx = TestAppContext::single();
+        let source = 7_u64;
+        let asset_id: AssetKey = (std::any::TypeId::of::<TestAsset>(), hash(&source));
+        let previous_usage = FxHashMap::default();
+        let mut current_usage = FxHashMap::default();
+        let mut current_assets = FxHashSet::default();
+        current_assets.insert(asset_id);
+        current_usage.insert(EntityId::from(1), current_assets);
+
+        cx.update(|cx| {
+            let (_, is_first) = cx.fetch_view_asset::<TestAsset>(&source);
+            assert!(is_first);
+            assert!(cx.inflight_assets.contains_key(&asset_id));
+            assert!(cx.view_owned_assets.contains_key(&asset_id));
+
+            cx.sync_view_asset_usage(&previous_usage, &current_usage);
+            assert_eq!(cx.view_asset_ref_counts.get(&asset_id), Some(&1));
+
+            cx.sync_view_asset_usage(&current_usage, &FxHashMap::default());
+            assert!(!cx.view_owned_assets.contains_key(&asset_id));
+            assert!(!cx.view_asset_ref_counts.contains_key(&asset_id));
+        });
+
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            assert!(!cx.inflight_assets.contains_key(&asset_id));
+            assert_eq!(TEST_ASSET_LOADS.load(SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn fetch_asset_reuses_inflight_work_but_keeps_persistent_result() {
+        let _guard = TEST_ASSET_TEST_LOCK.lock().unwrap();
+        TEST_ASSET_LOADS.store(0, SeqCst);
+
+        let cx = TestAppContext::single();
+        let source = 11_u64;
+        let asset_id: AssetKey = (std::any::TypeId::of::<TestAsset>(), hash(&source));
+
+        cx.update(|cx| {
+            let (_, is_first_cached) = cx.fetch_asset::<TestAsset>(&source);
+            let (_, is_first_view) = cx.fetch_view_asset::<TestAsset>(&source);
+            assert!(is_first_cached);
+            assert!(!is_first_view);
+            assert!(cx.inflight_assets.contains_key(&asset_id));
+            assert!(cx.cached_assets.contains_key(&asset_id));
+            assert!(cx.view_owned_assets.contains_key(&asset_id));
+        });
+
+        cx.run_until_parked();
+
+        cx.read(|cx| {
+            assert_eq!(TEST_ASSET_LOADS.load(SeqCst), 1);
+            assert!(!cx.inflight_assets.contains_key(&asset_id));
+            assert!(cx.cached_assets.contains_key(&asset_id));
+        });
     }
 }

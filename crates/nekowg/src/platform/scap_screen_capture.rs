@@ -24,7 +24,7 @@ pub fn scap_screen_sources(
 }
 
 /// Starts screen capture for the default target, and populates the receiver with a single source
-/// for it. The first frame of the screen capture is used to determine the size of the stream.
+/// for it. A short probe capture is used to determine the selected display and stream size.
 ///
 /// On Wayland (Linux), prompts the user to select a target, and populates the receiver with a
 /// single screen capture source for their selection.
@@ -108,94 +108,62 @@ impl ScreenCaptureSource for ScapCaptureSource {
     }
 }
 
-struct ScapDefaultTargetCaptureSource {
-    // Sender populated by single call to `ScreenCaptureSource::stream`.
-    stream_call_tx: std::sync::mpsc::SyncSender<(
-        // Provides the result of `ScreenCaptureSource::stream`.
-        oneshot::Sender<Result<ScapStream>>,
-        // Callback for frames.
-        Box<dyn Fn(ScreenCaptureFrame) + Send>,
-    )>,
-    target: scap::Display,
-    size: Size<DevicePixels>,
+trait CaptureProbe {
+    type Output;
+
+    fn start_capture(&mut self);
+    fn stop_capture(&mut self);
+    fn probe(&mut self) -> Result<Self::Output>;
 }
 
-/// Starts screen capture on the default capture target, and populates the sender with the source.
+impl CaptureProbe for scap::capturer::Capturer {
+    type Output = ScapCaptureSource;
+
+    fn start_capture(&mut self) {
+        scap::capturer::Capturer::start_capture(self);
+    }
+
+    fn stop_capture(&mut self) {
+        scap::capturer::Capturer::stop_capture(self);
+    }
+
+    fn probe(&mut self) -> Result<Self::Output> {
+        let first_frame = self
+            .get_next_frame()
+            .context("Failed to get first frame of screenshare to get the size.")?;
+        let size = frame_size(&first_frame);
+        let target = self
+            .target()
+            .context("Unable to determine the target display.")?;
+        let Target::Display(display) = target.clone() else {
+            anyhow::bail!("The screen capture source is not a display");
+        };
+
+        Ok(ScapCaptureSource {
+            target: display,
+            size,
+        })
+    }
+}
+
+fn run_capture_probe<P: CaptureProbe>(probe: &mut P) -> Result<P::Output> {
+    probe.start_capture();
+    let result = probe.probe();
+    probe.stop_capture();
+    result
+}
+
+/// Starts a short-lived capture on the default target, then populates the sender with the source.
 fn start_default_target_screen_capture(
-    sources_tx: oneshot::Sender<Result<Vec<ScapDefaultTargetCaptureSource>>>,
+    sources_tx: oneshot::Sender<Result<Vec<ScapCaptureSource>>>,
 ) {
     // Due to use of blocking APIs, a dedicated thread is used.
     std::thread::spawn(|| {
-        let start_result = nekowg_util::maybe!({
-            let mut capturer = new_scap_capturer(None)?;
-            capturer.start_capture();
-            let first_frame = capturer
-                .get_next_frame()
-                .context("Failed to get first frame of screenshare to get the size.")?;
-            let size = frame_size(&first_frame);
-            let target = capturer
-                .target()
-                .context("Unable to determine the target display.")?;
-            let target = target.clone();
-            Ok((capturer, size, target))
-        });
-
-        match start_result {
-            Ok((capturer, size, Target::Display(display))) => {
-                let (stream_call_tx, stream_rx) = std::sync::mpsc::sync_channel(1);
-                sources_tx
-                    .send(Ok(vec![ScapDefaultTargetCaptureSource {
-                        stream_call_tx,
-                        size,
-                        target: display.clone(),
-                    }]))
-                    .ok();
-                let Ok((stream_tx, frame_callback)) = stream_rx.recv() else {
-                    return;
-                };
-                run_capture(capturer, display, frame_callback, stream_tx);
-            }
-            Err(e) => {
-                sources_tx.send(Err(e)).ok();
-            }
-            _ => {
-                sources_tx
-                    .send(Err(anyhow!("The screen capture source is not a display")))
-                    .ok();
-            }
-        }
+        let result = new_scap_capturer(None)
+            .and_then(|mut capturer| run_capture_probe(&mut capturer))
+            .map(|source| vec![source]);
+        sources_tx.send(result).ok();
     });
-}
-
-impl ScreenCaptureSource for ScapDefaultTargetCaptureSource {
-    fn metadata(&self) -> Result<SourceMetadata> {
-        Ok(SourceMetadata {
-            resolution: self.size,
-            label: None,
-            is_main: None,
-            id: self.target.id as u64,
-        })
-    }
-
-    fn stream(
-        &self,
-        foreground_executor: &ForegroundExecutor,
-        frame_callback: Box<dyn Fn(ScreenCaptureFrame) + Send>,
-    ) -> oneshot::Receiver<Result<Box<dyn ScreenCaptureStream>>> {
-        let (tx, rx) = oneshot::channel();
-        match self.stream_call_tx.try_send((tx, frame_callback)) {
-            Ok(()) => {}
-            Err(std::sync::mpsc::TrySendError::Full((tx, _)))
-            | Err(std::sync::mpsc::TrySendError::Disconnected((tx, _))) => {
-                // Note: support could be added for being called again after end of prior stream.
-                tx.send(Err(anyhow!(
-                    "Can't call ScapDefaultTargetCaptureSource::stream multiple times."
-                )))
-                .ok();
-            }
-        }
-        to_dyn_screen_capture_stream(rx, foreground_executor)
-    }
 }
 
 fn new_scap_capturer(target: Option<scap::Target>) -> Result<scap::capturer::Capturer> {
@@ -322,4 +290,64 @@ fn to_dyn_screen_capture_stream<T: ScreenCaptureStream + 'static>(
         })
         .detach();
     dyn_sources_rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+
+    struct FakeProbe<T> {
+        output: Option<Result<T>>,
+        started: usize,
+        stopped: usize,
+    }
+
+    impl<T> CaptureProbe for FakeProbe<T> {
+        type Output = T;
+
+        fn start_capture(&mut self) {
+            self.started += 1;
+        }
+
+        fn stop_capture(&mut self) {
+            self.stopped += 1;
+        }
+
+        fn probe(&mut self) -> Result<Self::Output> {
+            self.output
+                .take()
+                .ok_or_else(|| anyhow!("probe output already taken"))?
+        }
+    }
+
+    #[test]
+    fn capture_probe_stops_after_success() {
+        let mut probe = FakeProbe {
+            output: Some(Ok("ok")),
+            started: 0,
+            stopped: 0,
+        };
+
+        let result = run_capture_probe(&mut probe).unwrap();
+
+        assert_eq!(result, "ok");
+        assert_eq!(probe.started, 1);
+        assert_eq!(probe.stopped, 1);
+    }
+
+    #[test]
+    fn capture_probe_stops_after_error() {
+        let mut probe = FakeProbe::<()> {
+            output: Some(Err(anyhow!("boom"))),
+            started: 0,
+            stopped: 0,
+        };
+
+        let result = run_capture_probe(&mut probe);
+
+        assert!(result.is_err());
+        assert_eq!(probe.started, 1);
+        assert_eq!(probe.stopped, 1);
+    }
 }

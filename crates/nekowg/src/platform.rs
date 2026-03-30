@@ -836,11 +836,13 @@ impl From<RenderImageParams> for AtlasKey {
 
 #[expect(missing_docs)]
 pub trait PlatformAtlas {
+    fn begin_frame(&self) {}
     fn get_or_insert_with<'a>(
         &self,
         key: &AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
+    fn end_frame(&self) {}
     fn remove(&self, key: &AtlasKey);
 }
 

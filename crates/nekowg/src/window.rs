@@ -19,15 +19,15 @@ use crate::{
     TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    hash, point, prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
-use futures::FutureExt;
 use futures::channel::oneshot;
+use futures::{FutureExt, future::Shared};
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
 use nekowg_util::post_inc;
@@ -741,6 +741,7 @@ pub(crate) struct Frame {
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
     accessed_element_states: Vec<(GlobalElementId, TypeId)>,
+    pub(crate) assets_by_view: FxHashMap<EntityId, FxHashSet<(TypeId, u64)>>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
@@ -787,6 +788,7 @@ impl Frame {
             window_active: false,
             element_states: FxHashMap::default(),
             accessed_element_states: Vec::new(),
+            assets_by_view: FxHashMap::default(),
             mouse_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
@@ -812,6 +814,7 @@ impl Frame {
     pub(crate) fn clear(&mut self) {
         self.element_states.clear();
         self.accessed_element_states.clear();
+        self.assets_by_view.clear();
         self.mouse_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
@@ -2256,6 +2259,7 @@ impl Window {
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
+        self.sprite_atlas.begin_frame();
 
         // Restore the previously-used input handler.
         if let Some(input_handler) = self.platform_window.take_input_handler() {
@@ -2275,6 +2279,11 @@ impl Window {
 
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
+        cx.sync_view_asset_usage(
+            &self.rendered_frame.assets_by_view,
+            &self.next_frame.assets_by_view,
+        );
+        self.sprite_atlas.end_frame();
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -2869,7 +2878,50 @@ impl Window {
     /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
     /// time.
     pub fn use_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
-        let (task, is_first) = cx.fetch_asset::<A>(source);
+        self.track_asset_usage::<A>(source);
+        let (task, is_first) = cx.fetch_view_asset::<A>(source);
+        self.resolve_asset_task::<A>(task, is_first, cx)
+    }
+
+    /// Asynchronously load an asset into the app-global persistent cache.
+    ///
+    /// This keeps the loaded result alive until `App::remove_asset` is called.
+    pub fn use_cached_asset<A: Asset>(
+        &mut self,
+        source: &A::Source,
+        cx: &mut App,
+    ) -> Option<A::Output> {
+        let (task, is_first) = cx.fetch_cached_asset::<A>(source);
+        self.resolve_asset_task::<A>(task, is_first, cx)
+    }
+
+    /// Asynchronously load an asset, if the asset hasn't finished loading or doesn't exist this will return None.
+    /// Your view will not be re-drawn once the asset has finished loading.
+    ///
+    /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
+    /// time.
+    pub fn get_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
+        self.track_asset_usage::<A>(source);
+        let (task, _) = cx.fetch_view_asset::<A>(source);
+        task.now_or_never()
+    }
+
+    /// Asynchronously load an asset from the app-global persistent cache without scheduling a redraw.
+    pub fn get_cached_asset<A: Asset>(
+        &mut self,
+        source: &A::Source,
+        cx: &mut App,
+    ) -> Option<A::Output> {
+        let (task, _) = cx.fetch_cached_asset::<A>(source);
+        task.now_or_never()
+    }
+
+    fn resolve_asset_task<A: Asset>(
+        &mut self,
+        task: Shared<Task<A::Output>>,
+        is_first: bool,
+        cx: &mut App,
+    ) -> Option<A::Output> {
         task.clone().now_or_never().or_else(|| {
             if is_first {
                 let entity_id = self.current_view();
@@ -2890,14 +2942,13 @@ impl Window {
         })
     }
 
-    /// Asynchronously load an asset, if the asset hasn't finished loading or doesn't exist this will return None.
-    /// Your view will not be re-drawn once the asset has finished loading.
-    ///
-    /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
-    /// time.
-    pub fn get_asset<A: Asset>(&mut self, source: &A::Source, cx: &mut App) -> Option<A::Output> {
-        let (task, _) = cx.fetch_asset::<A>(source);
-        task.now_or_never()
+    fn track_asset_usage<A: Asset>(&mut self, source: &A::Source) {
+        let asset_id = (TypeId::of::<A>(), hash(source));
+        self.next_frame
+            .assets_by_view
+            .entry(self.current_view())
+            .or_default()
+            .insert(asset_id);
     }
     /// Obtain the current element offset. This method should only be called during the
     /// prepaint phase of element drawing.
