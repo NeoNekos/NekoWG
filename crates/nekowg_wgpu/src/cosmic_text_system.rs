@@ -33,12 +33,25 @@ impl FontKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LoadedFontKey {
+    id: cosmic_text::fontdb::ID,
+    features: FontFeatures,
+}
+
+impl LoadedFontKey {
+    fn new(id: cosmic_text::fontdb::ID, features: FontFeatures) -> Self {
+        Self { id, features }
+    }
+}
+
 struct CosmicTextSystemState {
     font_system: FontSystem,
     scratch: ShapeBuffer,
     swash_scale_context: ScaleContext,
     /// Contains all already loaded fonts, including all faces. Indexed by `FontId`.
     loaded_fonts: Vec<LoadedFont>,
+    loaded_font_ids_by_key: HashMap<LoadedFontKey, FontId>,
     /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
     /// for every font face in a family.
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
@@ -60,6 +73,7 @@ impl CosmicTextSystem {
             scratch: ShapeBuffer::default(),
             swash_scale_context: ScaleContext::new(),
             loaded_fonts: Vec::new(),
+            loaded_font_ids_by_key: HashMap::default(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
         }))
@@ -76,6 +90,7 @@ impl CosmicTextSystem {
             scratch: ShapeBuffer::default(),
             swash_scale_context: ScaleContext::new(),
             loaded_fonts: Vec::new(),
+            loaded_font_ids_by_key: HashMap::default(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
         }))
@@ -245,13 +260,11 @@ impl CosmicTextSystemState {
                 continue;
             };
 
-            let font_id = FontId(self.loaded_fonts.len());
-            loaded_font_ids.push(font_id);
-            self.loaded_fonts.push(LoadedFont {
+            loaded_font_ids.push(self.load_or_insert_font(
                 font,
-                features: cosmic_font_features(features)?,
-                is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
-            });
+                features,
+                check_is_known_emoji_font(&postscript_name),
+            )?);
         }
 
         Ok(loaded_font_ids)
@@ -361,32 +374,47 @@ impl CosmicTextSystemState {
     /// current use of this field is for the *input* of `layout_line`, and so it's fine to use
     /// `font_id_for_cosmic_id` when computing the *output* of `layout_line`.
     fn font_id_for_cosmic_id(&mut self, id: cosmic_text::fontdb::ID) -> Result<FontId> {
-        if let Some(ix) = self
-            .loaded_fonts
-            .iter()
-            .position(|loaded_font| loaded_font.font.id() == id)
-        {
-            Ok(FontId(ix))
-        } else {
-            let font = self
-                .font_system
-                .get_font(id, cosmic_text::Weight::NORMAL)
-                .context("failed to get fallback font from cosmic-text font system")?;
-            let face = self
-                .font_system
-                .db()
-                .face(id)
-                .context("fallback font face not found in cosmic-text database")?;
-
-            let font_id = FontId(self.loaded_fonts.len());
-            self.loaded_fonts.push(LoadedFont {
-                font,
-                features: CosmicFontFeatures::new(),
-                is_known_emoji_font: check_is_known_emoji_font(&face.post_script_name),
-            });
-
-            Ok(font_id)
+        let key = LoadedFontKey::new(id, FontFeatures::default());
+        if let Some(&font_id) = self.loaded_font_ids_by_key.get(&key) {
+            return Ok(font_id);
         }
+
+        let font = self
+            .font_system
+            .get_font(id, cosmic_text::Weight::NORMAL)
+            .context("failed to get fallback font from cosmic-text font system")?;
+        let face = self
+            .font_system
+            .db()
+            .face(id)
+            .context("fallback font face not found in cosmic-text database")?;
+
+        self.load_or_insert_font(
+            font,
+            &FontFeatures::default(),
+            check_is_known_emoji_font(&face.post_script_name),
+        )
+    }
+
+    fn load_or_insert_font(
+        &mut self,
+        font: Arc<CosmicTextFont>,
+        features: &FontFeatures,
+        is_known_emoji_font: bool,
+    ) -> Result<FontId> {
+        let key = LoadedFontKey::new(font.id(), features.clone());
+        if let Some(&font_id) = self.loaded_font_ids_by_key.get(&key) {
+            return Ok(font_id);
+        }
+
+        let font_id = FontId(self.loaded_fonts.len());
+        self.loaded_fonts.push(LoadedFont {
+            font,
+            features: cosmic_font_features(features)?,
+            is_known_emoji_font,
+        });
+        self.loaded_font_ids_by_key.insert(key, font_id);
+        Ok(font_id)
     }
 
     #[profiling::function]
@@ -642,4 +670,22 @@ fn face_info_into_properties(
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
     // TODO: Include other common emoji fonts
     postscript_name == "NotoColorEmoji"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn loaded_font_key_distinguishes_features() {
+        let base = LoadedFontKey::new(cosmic_text::fontdb::ID::default(), FontFeatures::default());
+
+        let different_features = LoadedFontKey::new(
+            cosmic_text::fontdb::ID::default(),
+            FontFeatures(Arc::new(vec![("liga".into(), 0)])),
+        );
+
+        assert_ne!(base, different_features);
+    }
 }

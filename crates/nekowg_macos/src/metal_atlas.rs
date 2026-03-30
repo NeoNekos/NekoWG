@@ -4,8 +4,8 @@ use derive_more::{Deref, DerefMut};
 use etagere::BucketedAtlasAllocator;
 use metal::Device;
 use nekowg::{
-    AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
-    PlatformAtlas, Point, Size,
+    AtlasKey, AtlasStats, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds,
+    DevicePixels, PlatformAtlas, Point, Size, atlas_entry_is_stale,
 };
 use parking_lot::Mutex;
 use std::borrow::Cow;
@@ -26,6 +26,7 @@ impl MetalAtlas {
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
             tiles_by_key: Default::default(),
+            removed_keys: Vec::new(),
             current_frame: 0,
         }))
     }
@@ -41,6 +42,7 @@ struct MetalAtlasState {
     monochrome_textures: AtlasTextureList<MetalAtlasTexture>,
     polychrome_textures: AtlasTextureList<MetalAtlasTexture>,
     tiles_by_key: FxHashMap<AtlasKey, AtlasEntry>,
+    removed_keys: Vec<AtlasKey>,
     current_frame: u64,
 }
 
@@ -87,12 +89,22 @@ impl PlatformAtlas for MetalAtlas {
             .tiles_by_key
             .iter()
             .filter_map(|(key, entry)| {
-                (entry.last_used_frame.saturating_add(1) < current_frame).then_some(key.clone())
+                atlas_entry_is_stale(entry.last_used_frame, current_frame).then_some(key.clone())
             })
             .collect::<Vec<_>>();
         for key in stale_keys {
             lock.remove_entry(&key);
         }
+    }
+
+    fn drain_removed_keys(&self, out: &mut Vec<AtlasKey>) {
+        let mut lock = self.0.lock();
+        out.append(&mut lock.removed_keys);
+    }
+
+    fn stats(&self) -> AtlasStats {
+        let lock = self.0.lock();
+        lock.stats()
     }
 
     fn remove(&self, key: &AtlasKey) {
@@ -102,6 +114,28 @@ impl PlatformAtlas for MetalAtlas {
 }
 
 impl MetalAtlasState {
+    fn stats(&self) -> AtlasStats {
+        AtlasStats {
+            entry_count: self.tiles_by_key.len(),
+            texture_count: self.monochrome_textures.textures.iter().flatten().count()
+                + self.polychrome_textures.textures.iter().flatten().count(),
+            estimated_bytes: self
+                .monochrome_textures
+                .textures
+                .iter()
+                .flatten()
+                .map(MetalAtlasTexture::estimated_bytes)
+                .sum::<usize>()
+                + self
+                    .polychrome_textures
+                    .textures
+                    .iter()
+                    .flatten()
+                    .map(MetalAtlasTexture::estimated_bytes)
+                    .sum::<usize>(),
+        }
+    }
+
     fn allocate(
         &mut self,
         size: Size<DevicePixels>,
@@ -182,6 +216,7 @@ impl MetalAtlasState {
                 index: index.unwrap_or(texture_list.textures.len()) as u32,
                 kind,
             },
+            size,
             allocator: etagere::BucketedAtlasAllocator::new(size_to_etagere(size)),
             metal_texture: AssertSend(metal_texture),
             live_atlas_keys: 0,
@@ -212,6 +247,7 @@ impl MetalAtlasState {
         let Some(entry) = self.tiles_by_key.remove(key) else {
             return;
         };
+        self.removed_keys.push(key.clone());
         let tile = entry.tile;
 
         let textures = match tile.texture_id.kind {
@@ -238,12 +274,19 @@ impl MetalAtlasState {
 
 struct MetalAtlasTexture {
     id: AtlasTextureId,
+    size: Size<DevicePixels>,
     allocator: BucketedAtlasAllocator,
     metal_texture: AssertSend<metal::Texture>,
     live_atlas_keys: u32,
 }
 
 impl MetalAtlasTexture {
+    fn estimated_bytes(&self) -> usize {
+        self.size.width.0.max(0) as usize
+            * self.size.height.0.max(0) as usize
+            * self.bytes_per_pixel() as usize
+    }
+
     fn allocate(&mut self, size: Size<DevicePixels>) -> Option<AtlasTile> {
         let allocation = self.allocator.allocate(size_to_etagere(size))?;
         let tile = AtlasTile {

@@ -2,8 +2,8 @@
 use crate::Inspector;
 use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App,
-    AppContext, Arena, Asset, AsyncWindowContext, AvailableSpace, BackdropFilter, Background,
-    BorderStyle, Bounds, BoxShadow, Capslock, Context, Corners, CursorStyle,
+    AppContext, Arena, Asset, AsyncWindowContext, AtlasKey, AvailableSpace, BackdropFilter,
+    Background, BorderStyle, Bounds, BoxShadow, Capslock, Context, Corners, CursorStyle,
     DEFAULT_IMAGE_CACHE_BYTES, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId,
     DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId,
     Global, GlobalElementId, GlyphId, GpuRecordedGraph, GpuSpecs, GpuSurfaceExecutionInput,
@@ -929,6 +929,7 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    atlas_removed_keys: Vec<AtlasKey>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
@@ -1416,6 +1417,7 @@ impl Window {
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            atlas_removed_keys: Vec::new(),
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -2284,6 +2286,15 @@ impl Window {
             &self.next_frame.assets_by_view,
         );
         self.sprite_atlas.end_frame();
+        self.atlas_removed_keys.clear();
+        self.sprite_atlas
+            .drain_removed_keys(&mut self.atlas_removed_keys);
+        let removed_keys = mem::take(&mut self.atlas_removed_keys);
+        for key in removed_keys {
+            if let AtlasKey::Glyph(params) = key {
+                self.text_system().remove_raster_bounds(&params);
+            }
+        }
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);

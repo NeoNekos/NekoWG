@@ -35,6 +35,30 @@ struct FontInfo {
     font_collection: IDWriteFontCollection1,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DirectWriteFontFaceKey {
+    family: SharedString,
+    weight: i32,
+    style: i32,
+    stretch: i32,
+}
+
+impl DirectWriteFontFaceKey {
+    fn new(
+        family: SharedString,
+        weight: DWRITE_FONT_WEIGHT,
+        style: DWRITE_FONT_STYLE,
+        stretch: DWRITE_FONT_STRETCH,
+    ) -> Self {
+        Self {
+            family,
+            weight: weight.0,
+            style: style.0,
+            stretch: stretch.0,
+        }
+    }
+}
+
 pub(crate) struct DirectWriteTextSystem {
     components: DirectWriteComponents,
     state: RwLock<DirectWriteState>,
@@ -75,7 +99,8 @@ struct DirectWriteState {
     custom_font_collection: IDWriteFontCollection1,
     fonts: Vec<FontInfo>,
     font_to_font_id: HashMap<Font, FontId>,
-    font_info_cache: HashMap<usize, FontId>,
+    font_face_ids_by_key: HashMap<DirectWriteFontFaceKey, FontId>,
+    font_face_ids_by_ptr: HashMap<usize, FontId>,
     layout_line_scratch: Vec<u16>,
 }
 
@@ -212,7 +237,8 @@ impl DirectWriteTextSystem {
                 custom_font_collection,
                 fonts: Vec::new(),
                 font_to_font_id: HashMap::default(),
-                font_info_cache: HashMap::default(),
+                font_face_ids_by_key: HashMap::default(),
+                font_face_ids_by_ptr: HashMap::default(),
                 layout_line_scratch: Vec::new(),
             }),
         })
@@ -320,9 +346,15 @@ impl DirectWriteState {
                 })?;
 
             let font_id = FontId(this.fonts.len());
-            let font_face_key = info.font_face.cast::<IUnknown>().unwrap().as_raw().addr();
+            let font_face_key = direct_write_font_face_key(
+                &info.font_face,
+                &components.locale,
+                Some(info.font_family_h.to_string_lossy().into()),
+            )?;
+            let font_face_ptr = info.font_face.cast::<IUnknown>().unwrap().as_raw().addr();
             this.fonts.push(info);
-            this.font_info_cache.insert(font_face_key, font_id);
+            this.font_face_ids_by_key.insert(font_face_key, font_id);
+            this.font_face_ids_by_ptr.insert(font_face_ptr, font_id);
             Some(font_id)
         };
 
@@ -1489,16 +1521,31 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             ));
         };
 
-        let font_face_key = font_face.cast::<IUnknown>().unwrap().as_raw().addr();
+        let font_face_ptr = font_face.cast::<IUnknown>().unwrap().as_raw().addr();
         let font_id = context
             .text_system
-            .font_info_cache
-            .get(&font_face_key)
+            .font_face_ids_by_ptr
+            .get(&font_face_ptr)
             .copied()
-            // in some circumstances, we might be getting served a FontFace that we did not create ourselves
-            // so create a new font from it and cache it accordingly. The usual culprit here seems to be Segoe UI Symbol
             .map_or_else(
                 || {
+                    let font_face_key = direct_write_font_face_key(font_face, &self.locale, None)
+                        .ok_or_else(|| {
+                        Error::new(DWRITE_E_NOFONT, "Failed to identify font face")
+                    })?;
+                    if let Some(&font_id) =
+                        context.text_system.font_face_ids_by_key.get(&font_face_key)
+                    {
+                        context
+                            .text_system
+                            .font_face_ids_by_ptr
+                            .insert(font_face_ptr, font_id);
+                        return windows::core::Result::Ok(font_id);
+                    }
+
+                    // In some circumstances, we might be getting served a FontFace that we did not
+                    // create ourselves, so create a new font from it and cache it accordingly.
+                    // The usual culprit here seems to be Segoe UI Symbol.
                     let font = font_face_to_font(font_face, &self.locale)
                         .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?;
                     let font_id = match context.text_system.font_to_font_id.get(&font) {
@@ -1510,8 +1557,12 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                     };
                     context
                         .text_system
-                        .font_info_cache
+                        .font_face_ids_by_key
                         .insert(font_face_key, font_id);
+                    context
+                        .text_system
+                        .font_face_ids_by_ptr
+                        .insert(font_face_ptr, font_id);
                     windows::core::Result::Ok(font_id)
                 },
                 Ok,
@@ -1694,17 +1745,31 @@ fn get_font_names_from_collection(
 }
 
 fn font_face_to_font(font_face: &IDWriteFontFace3, locale: &HSTRING) -> Option<Font> {
-    let localized_family_name = unsafe { font_face.GetFamilyNames().log_err() }?;
-    let family_name = get_name(localized_family_name, locale).log_err()?;
-    let weight = unsafe { font_face.GetWeight() };
-    let style = unsafe { font_face.GetStyle() };
+    let font_face_key = direct_write_font_face_key(font_face, locale, None)?;
     Some(Font {
-        family: family_name.into(),
+        family: font_face_key.family,
         features: FontFeatures::default(),
-        weight: font_weight_from_dwrite(weight),
-        style: font_style_from_dwrite(style),
+        weight: font_weight_from_dwrite(DWRITE_FONT_WEIGHT(font_face_key.weight)),
+        style: font_style_from_dwrite(DWRITE_FONT_STYLE(font_face_key.style)),
         fallbacks: None,
     })
+}
+
+fn direct_write_font_face_key(
+    font_face: &IDWriteFontFace3,
+    locale: &HSTRING,
+    family_override: Option<SharedString>,
+) -> Option<DirectWriteFontFaceKey> {
+    let family = if let Some(family) = family_override {
+        family
+    } else {
+        let localized_family_name = unsafe { font_face.GetFamilyNames().log_err() }?;
+        get_name(localized_family_name, locale).log_err()?.into()
+    };
+    let weight = unsafe { font_face.GetWeight() };
+    let style = unsafe { font_face.GetStyle() };
+    let stretch = unsafe { font_face.GetStretch() };
+    Some(DirectWriteFontFaceKey::new(family, weight, style, stretch))
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/api/dwrite/ne-dwrite-dwrite_font_feature_tag
@@ -1879,7 +1944,12 @@ const DEFAULT_LOCALE_NAME: PCWSTR = windows::core::w!("en-US");
 
 #[cfg(test)]
 mod tests {
-    use crate::direct_write::ClusterAnalyzer;
+    use crate::direct_write::{ClusterAnalyzer, DirectWriteFontFaceKey};
+    use nekowg::SharedString;
+    use windows::Win32::Graphics::DirectWrite::{
+        DWRITE_FONT_STRETCH_CONDENSED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_ITALIC,
+        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
+    };
 
     #[test]
     fn test_cluster_map() {
@@ -1916,5 +1986,30 @@ mod tests {
         assert_eq!(next, Some((5, 1)));
         let next = analyzer.next();
         assert_eq!(next, None);
+    }
+
+    #[test]
+    fn direct_write_font_face_key_is_stable_for_equivalent_faces() {
+        let a = DirectWriteFontFaceKey::new(
+            SharedString::from("Segoe UI"),
+            DWRITE_FONT_WEIGHT_BOLD,
+            DWRITE_FONT_STYLE_ITALIC,
+            DWRITE_FONT_STRETCH_NORMAL,
+        );
+        let b = DirectWriteFontFaceKey::new(
+            SharedString::from("Segoe UI"),
+            DWRITE_FONT_WEIGHT_BOLD,
+            DWRITE_FONT_STYLE_ITALIC,
+            DWRITE_FONT_STRETCH_NORMAL,
+        );
+        let c = DirectWriteFontFaceKey::new(
+            SharedString::from("Segoe UI"),
+            DWRITE_FONT_WEIGHT_BOLD,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_CONDENSED,
+        );
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }

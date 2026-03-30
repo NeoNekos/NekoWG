@@ -318,6 +318,7 @@ impl PlatformWindow for TestWindow {
 pub(crate) struct TestAtlasState {
     next_id: u32,
     tiles: HashMap<AtlasKey, AtlasTile>,
+    removed: Vec<AtlasKey>,
 }
 
 pub(crate) struct TestAtlas(Mutex<TestAtlasState>);
@@ -327,6 +328,7 @@ impl TestAtlas {
         TestAtlas(Mutex::new(TestAtlasState {
             next_id: 0,
             tiles: HashMap::default(),
+            removed: Vec::new(),
         }))
     }
 }
@@ -374,8 +376,15 @@ impl PlatformAtlas for TestAtlas {
         Ok(Some(state.tiles[key].clone()))
     }
 
+    fn drain_removed_keys(&self, out: &mut Vec<AtlasKey>) {
+        let mut state = self.0.lock();
+        out.append(&mut state.removed);
+    }
+
     fn remove(&self, key: &AtlasKey) {
         let mut state = self.0.lock();
-        state.tiles.remove(key);
+        if state.tiles.remove(key).is_some() {
+            state.removed.push(key.clone());
+        }
     }
 }

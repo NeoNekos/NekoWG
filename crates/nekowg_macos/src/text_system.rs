@@ -62,12 +62,34 @@ struct FontKey {
     font_fallbacks: Option<FontFallbacks>,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct LoadedFontKey {
+    postscript_name: String,
+    font_features: FontFeatures,
+    font_fallbacks: Option<FontFallbacks>,
+}
+
+impl LoadedFontKey {
+    fn new(
+        postscript_name: String,
+        font_features: FontFeatures,
+        font_fallbacks: Option<FontFallbacks>,
+    ) -> Self {
+        Self {
+            postscript_name,
+            font_features,
+            font_fallbacks,
+        }
+    }
+}
+
 struct MacTextSystemState {
     memory_source: MemSource,
     system_source: SystemSource,
     fonts: Vec<FontKitFont>,
     font_selections: HashMap<Font, FontId>,
-    font_ids_by_postscript_name: HashMap<String, FontId>,
+    loaded_font_ids_by_key: HashMap<LoadedFontKey, FontId>,
+    native_font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
 }
@@ -79,7 +101,8 @@ impl MacTextSystem {
             system_source: SystemSource::new(),
             fonts: Vec::new(),
             font_selections: HashMap::default(),
-            font_ids_by_postscript_name: HashMap::default(),
+            loaded_font_ids_by_key: HashMap::default(),
+            native_font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
         }))
@@ -308,14 +331,23 @@ impl MacTextSystemState {
                 continue;
             }
 
-            let font_id = FontId(self.fonts.len());
-            font_ids.push(font_id);
             let postscript_name = font.postscript_name().unwrap();
-            self.font_ids_by_postscript_name
-                .insert(postscript_name.clone(), font_id);
-            self.postscript_names_by_font_id
-                .insert(font_id, postscript_name);
-            self.fonts.push(font);
+            let key = LoadedFontKey::new(
+                postscript_name.clone(),
+                features.clone(),
+                fallbacks.cloned(),
+            );
+            let font_id = if let Some(&font_id) = self.loaded_font_ids_by_key.get(&key) {
+                font_id
+            } else {
+                let font_id = FontId(self.fonts.len());
+                self.loaded_font_ids_by_key.insert(key, font_id);
+                self.postscript_names_by_font_id
+                    .insert(font_id, postscript_name);
+                self.fonts.push(font);
+                font_id
+            };
+            font_ids.push(font_id);
         }
         Ok(font_ids)
     }
@@ -332,11 +364,14 @@ impl MacTextSystemState {
 
     fn id_for_native_font(&mut self, requested_font: CTFont) -> FontId {
         let postscript_name = requested_font.postscript_name();
-        if let Some(font_id) = self.font_ids_by_postscript_name.get(&postscript_name) {
+        if let Some(font_id) = self
+            .native_font_ids_by_postscript_name
+            .get(&postscript_name)
+        {
             *font_id
         } else {
             let font_id = FontId(self.fonts.len());
-            self.font_ids_by_postscript_name
+            self.native_font_ids_by_postscript_name
                 .insert(postscript_name.clone(), font_id);
             self.postscript_names_by_font_id
                 .insert(font_id, postscript_name);
@@ -695,7 +730,28 @@ mod lenient_font_attributes {
 #[cfg(test)]
 mod tests {
     use crate::MacTextSystem;
-    use nekowg::{FontRun, GlyphId, PlatformTextSystem, font, px};
+    use nekowg::{FontFallbacks, FontFeatures, FontRun, GlyphId, PlatformTextSystem, font, px};
+    use std::sync::Arc;
+
+    use super::LoadedFontKey;
+
+    #[test]
+    fn loaded_font_key_distinguishes_features_and_fallbacks() {
+        let base = LoadedFontKey::new("Helvetica".into(), FontFeatures::default(), None);
+        let different_features = LoadedFontKey::new(
+            "Helvetica".into(),
+            FontFeatures(Arc::new(vec![("liga".into(), 0)])),
+            None,
+        );
+        let different_fallbacks = LoadedFontKey::new(
+            "Helvetica".into(),
+            FontFeatures::default(),
+            Some(FontFallbacks::from_fonts(vec!["Arial Unicode MS".into()])),
+        );
+
+        assert_ne!(base, different_features);
+        assert_ne!(base, different_fallbacks);
+    }
 
     #[test]
     fn test_layout_line_bom_char() {

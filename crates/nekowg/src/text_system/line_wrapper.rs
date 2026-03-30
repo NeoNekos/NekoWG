@@ -34,6 +34,17 @@ impl LineWrapper {
         }
     }
 
+    pub(crate) fn reset(&mut self, font_id: FontId, font_size: Pixels) {
+        self.font_id = font_id;
+        self.font_size = font_size;
+        self.clear_cached_widths();
+    }
+
+    pub(crate) fn clear_cached_widths(&mut self) {
+        self.cached_ascii_char_widths = [None; 128];
+        self.cached_other_char_widths.clear();
+    }
+
     /// Wrap a line of text to the given width with this wrapper's font and font size.
     pub fn wrap_line<'a>(
         &'a mut self,
@@ -542,6 +553,21 @@ mod tests {
                 Boundary::new(18, 0)
             ],
         );
+    }
+
+    #[test]
+    fn test_clear_cached_widths_releases_char_width_cache() {
+        let mut wrapper = build_wrapper();
+
+        let _ = wrapper.width_for_char('a');
+        let _ = wrapper.width_for_char('界');
+        assert!(wrapper.cached_ascii_char_widths['a' as usize].is_some());
+        assert!(!wrapper.cached_other_char_widths.is_empty());
+
+        wrapper.clear_cached_widths();
+
+        assert!(wrapper.cached_ascii_char_widths.iter().all(Option::is_none));
+        assert!(wrapper.cached_other_char_widths.is_empty());
     }
 
     #[test]

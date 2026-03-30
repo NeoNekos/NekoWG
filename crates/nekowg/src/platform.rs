@@ -843,7 +843,24 @@ pub trait PlatformAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
     fn end_frame(&self) {}
+    fn drain_removed_keys(&self, _out: &mut Vec<AtlasKey>) {}
+    fn stats(&self) -> AtlasStats {
+        AtlasStats::default()
+    }
     fn remove(&self, key: &AtlasKey);
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AtlasStats {
+    pub entry_count: usize,
+    pub texture_count: usize,
+    pub estimated_bytes: usize,
+}
+
+#[doc(hidden)]
+pub fn atlas_entry_is_stale(last_used_frame: u64, current_frame: u64) -> bool {
+    last_used_frame.saturating_add(1) < current_frame
 }
 
 #[doc(hidden)]
@@ -879,6 +896,26 @@ impl<T> AtlasTextureList<T> {
     #[allow(dead_code)]
     pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut T> {
         self.textures.iter_mut().flatten()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::atlas_entry_is_stale;
+
+    #[test]
+    fn atlas_residency_keeps_current_frame_entries() {
+        assert!(!atlas_entry_is_stale(8, 8));
+    }
+
+    #[test]
+    fn atlas_residency_keeps_previous_frame_entries() {
+        assert!(!atlas_entry_is_stale(7, 8));
+    }
+
+    #[test]
+    fn atlas_residency_sweeps_entries_unused_for_two_frames() {
+        assert!(atlas_entry_is_stale(6, 8));
     }
 }
 

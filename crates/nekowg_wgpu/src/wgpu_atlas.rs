@@ -2,8 +2,8 @@ use anyhow::{Context as _, Result};
 use collections::FxHashMap;
 use etagere::{BucketedAtlasAllocator, size2};
 use nekowg::{
-    AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
-    PlatformAtlas, Point, Size,
+    AtlasKey, AtlasStats, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds,
+    DevicePixels, PlatformAtlas, Point, Size, atlas_entry_is_stale,
 };
 use parking_lot::Mutex;
 use std::{borrow::Cow, ops, sync::Arc};
@@ -39,6 +39,7 @@ struct WgpuAtlasState {
     max_texture_size: u32,
     storage: WgpuAtlasStorage,
     tiles_by_key: FxHashMap<AtlasKey, AtlasEntry>,
+    removed_keys: Vec<AtlasKey>,
     pending_uploads: Vec<PendingUpload>,
     current_frame: u64,
 }
@@ -56,6 +57,7 @@ impl WgpuAtlas {
             max_texture_size,
             storage: WgpuAtlasStorage::default(),
             tiles_by_key: Default::default(),
+            removed_keys: Vec::new(),
             pending_uploads: Vec::new(),
             current_frame: 0,
         }))
@@ -81,6 +83,8 @@ impl WgpuAtlas {
         lock.device = device;
         lock.queue = queue;
         lock.storage = WgpuAtlasStorage::default();
+        let removed_keys = lock.tiles_by_key.keys().cloned().collect::<Vec<_>>();
+        lock.removed_keys.extend(removed_keys);
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
         lock.current_frame = 0;
@@ -130,12 +134,22 @@ impl PlatformAtlas for WgpuAtlas {
             .tiles_by_key
             .iter()
             .filter_map(|(key, entry)| {
-                (entry.last_used_frame.saturating_add(1) < current_frame).then_some(key.clone())
+                atlas_entry_is_stale(entry.last_used_frame, current_frame).then_some(key.clone())
             })
             .collect::<Vec<_>>();
         for key in stale_keys {
             lock.remove_entry(&key);
         }
+    }
+
+    fn drain_removed_keys(&self, out: &mut Vec<AtlasKey>) {
+        let mut lock = self.0.lock();
+        out.append(&mut lock.removed_keys);
+    }
+
+    fn stats(&self) -> AtlasStats {
+        let lock = self.0.lock();
+        lock.stats()
     }
 
     fn remove(&self, key: &AtlasKey) {
@@ -145,6 +159,14 @@ impl PlatformAtlas for WgpuAtlas {
 }
 
 impl WgpuAtlasState {
+    fn stats(&self) -> AtlasStats {
+        AtlasStats {
+            entry_count: self.tiles_by_key.len(),
+            texture_count: self.storage.texture_count(),
+            estimated_bytes: self.storage.estimated_bytes(),
+        }
+    }
+
     fn allocate(
         &mut self,
         size: Size<DevicePixels>,
@@ -213,6 +235,7 @@ impl WgpuAtlasState {
                 index: index.unwrap_or(texture_list.textures.len()) as u32,
                 kind,
             },
+            size,
             allocator: BucketedAtlasAllocator::new(device_size_to_etagere(size)),
             format,
             texture,
@@ -280,6 +303,7 @@ impl WgpuAtlasState {
         let Some(entry) = self.tiles_by_key.remove(key) else {
             return;
         };
+        self.removed_keys.push(key.clone());
         let tile = entry.tile;
         self.pending_uploads
             .retain(|upload| upload.id != tile.texture_id || upload.bounds != tile.bounds);
@@ -342,8 +366,40 @@ impl ops::Index<AtlasTextureId> for WgpuAtlasStorage {
     }
 }
 
+impl WgpuAtlasStorage {
+    fn texture_count(&self) -> usize {
+        self.monochrome_textures.textures.iter().flatten().count()
+            + self.subpixel_textures.textures.iter().flatten().count()
+            + self.polychrome_textures.textures.iter().flatten().count()
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        self.monochrome_textures
+            .textures
+            .iter()
+            .flatten()
+            .map(WgpuAtlasTexture::estimated_bytes)
+            .sum::<usize>()
+            + self
+                .subpixel_textures
+                .textures
+                .iter()
+                .flatten()
+                .map(WgpuAtlasTexture::estimated_bytes)
+                .sum::<usize>()
+            + self
+                .polychrome_textures
+                .textures
+                .iter()
+                .flatten()
+                .map(WgpuAtlasTexture::estimated_bytes)
+                .sum::<usize>()
+    }
+}
+
 struct WgpuAtlasTexture {
     id: AtlasTextureId,
+    size: Size<DevicePixels>,
     allocator: BucketedAtlasAllocator,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -352,6 +408,12 @@ struct WgpuAtlasTexture {
 }
 
 impl WgpuAtlasTexture {
+    fn estimated_bytes(&self) -> usize {
+        self.size.width.0.max(0) as usize
+            * self.size.height.0.max(0) as usize
+            * self.bytes_per_pixel() as usize
+    }
+
     fn allocate(&mut self, size: Size<DevicePixels>) -> Option<AtlasTile> {
         let allocation = self.allocator.allocate(device_size_to_etagere(size))?;
         let tile = AtlasTile {

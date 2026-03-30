@@ -51,6 +51,9 @@ pub const SUBPIXEL_VARIANTS_Y: u8 = if cfg!(target_os = "windows") || cfg!(targe
     SUBPIXEL_VARIANTS_X
 };
 
+const LINE_WRAPPER_POOL_BUCKETS_PER_PIXEL: f32 = 2.0;
+const MAX_LINE_WRAPPERS_PER_BUCKET: usize = 4;
+
 /// The NekoWG text rendering sub system.
 pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
@@ -317,10 +320,14 @@ impl TextSystem {
         let lock = &mut self.wrapper_pool.lock();
         let font_id = self.resolve_font(&font);
         let wrappers = lock
-            .entry(FontIdWithSize { font_id, font_size })
+            .entry(FontIdWithSize::new(font_id, font_size))
             .or_default();
         let wrapper = wrappers
             .pop()
+            .map(|mut wrapper| {
+                wrapper.reset(font_id, font_size);
+                wrapper
+            })
             .unwrap_or_else(|| LineWrapper::new(font_id, font_size, self.clone()));
 
         LineWrapperHandle {
@@ -340,6 +347,10 @@ impl TextSystem {
             raster_bounds.insert(params.clone(), bounds);
             Ok(bounds)
         }
+    }
+
+    pub(crate) fn remove_raster_bounds(&self, params: &RenderGlyphParams) {
+        self.raster_bounds.write().remove(params);
     }
 
     pub(crate) fn rasterize_glyph(
@@ -632,7 +643,16 @@ impl WindowTextSystem {
 #[derive(Hash, Eq, PartialEq)]
 struct FontIdWithSize {
     font_id: FontId,
-    font_size: Pixels,
+    font_size_bucket: i32,
+}
+
+impl FontIdWithSize {
+    fn new(font_id: FontId, font_size: Pixels) -> Self {
+        Self {
+            font_id,
+            font_size_bucket: quantize_line_wrapper_font_size(font_size),
+        }
+    }
 }
 
 /// A handle into the text system, which can be used to compute the wrapped layout of text
@@ -644,14 +664,15 @@ pub struct LineWrapperHandle {
 impl Drop for LineWrapperHandle {
     fn drop(&mut self) {
         let mut state = self.text_system.wrapper_pool.lock();
-        let wrapper = self.wrapper.take().unwrap();
-        state
-            .get_mut(&FontIdWithSize {
-                font_id: wrapper.font_id,
-                font_size: wrapper.font_size,
-            })
-            .unwrap()
-            .push(wrapper);
+        let mut wrapper = self.wrapper.take().unwrap();
+        wrapper.clear_cached_widths();
+
+        let wrappers = state
+            .entry(FontIdWithSize::new(wrapper.font_id, wrapper.font_size))
+            .or_default();
+        if wrappers.len() < MAX_LINE_WRAPPERS_PER_BUCKET {
+            wrappers.push(wrapper);
+        }
     }
 }
 
@@ -802,7 +823,7 @@ impl TextRun {
 #[repr(C)]
 pub struct GlyphId(pub u32);
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 #[expect(missing_docs)]
 pub struct RenderGlyphParams {
     pub font_id: FontId,
@@ -814,18 +835,45 @@ pub struct RenderGlyphParams {
     pub subpixel_rendering: bool,
 }
 
+impl RenderGlyphParams {
+    #[inline]
+    fn quantized_device_font_size(&self) -> i32 {
+        quantize_glyph_device_font_size(self.font_size, self.scale_factor)
+    }
+}
+
+impl PartialEq for RenderGlyphParams {
+    fn eq(&self, other: &Self) -> bool {
+        self.font_id == other.font_id
+            && self.glyph_id == other.glyph_id
+            && self.quantized_device_font_size() == other.quantized_device_font_size()
+            && self.subpixel_variant == other.subpixel_variant
+            && self.is_emoji == other.is_emoji
+            && self.subpixel_rendering == other.subpixel_rendering
+    }
+}
+
 impl Eq for RenderGlyphParams {}
 
 impl Hash for RenderGlyphParams {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.font_id.0.hash(state);
         self.glyph_id.0.hash(state);
-        self.font_size.0.to_bits().hash(state);
+        self.quantized_device_font_size().hash(state);
         self.subpixel_variant.hash(state);
-        self.scale_factor.to_bits().hash(state);
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
     }
+}
+
+#[inline]
+fn quantize_glyph_device_font_size(font_size: Pixels, scale_factor: f32) -> i32 {
+    ((font_size.0 * scale_factor) * SUBPIXEL_VARIANTS_X as f32).round() as i32
+}
+
+#[inline]
+fn quantize_line_wrapper_font_size(font_size: Pixels) -> i32 {
+    (font_size.0 * LINE_WRAPPER_POOL_BUCKETS_PER_PIXEL).round() as i32
 }
 
 /// The configuration details for identifying a specific font.
@@ -984,5 +1032,84 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Bounds, TestAppContext, TestDispatcher, point, size};
+    use std::collections::hash_map::DefaultHasher;
+
+    fn params(font_size: f32, scale_factor: f32) -> RenderGlyphParams {
+        RenderGlyphParams {
+            font_id: FontId(1),
+            glyph_id: GlyphId(7),
+            font_size: px(font_size),
+            subpixel_variant: Point { x: 1, y: 0 },
+            scale_factor,
+            is_emoji: false,
+            subpixel_rendering: true,
+        }
+    }
+
+    fn hash_value(params: &RenderGlyphParams) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        params.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn render_glyph_params_quantize_micro_font_size_changes() {
+        let a = params(12.0, 2.0);
+        let b = params(12.0001, 2.0);
+
+        assert_eq!(a, b);
+        assert_eq!(hash_value(&a), hash_value(&b));
+    }
+
+    #[test]
+    fn render_glyph_params_canonicalize_in_device_space() {
+        let a = params(12.0, 2.0);
+        let b = params(24.0, 1.0);
+
+        assert_eq!(a, b);
+        assert_eq!(hash_value(&a), hash_value(&b));
+    }
+
+    #[test]
+    fn render_glyph_params_keep_distinct_device_size_buckets() {
+        let a = params(12.0, 1.0);
+        let b = params(12.5, 1.0);
+
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn line_wrapper_pool_bucket_quantizes_nearby_font_sizes() {
+        assert_eq!(quantize_line_wrapper_font_size(px(12.0)), 24);
+        assert_eq!(quantize_line_wrapper_font_size(px(12.2)), 24);
+        assert_eq!(quantize_line_wrapper_font_size(px(12.8)), 26);
+    }
+
+    #[test]
+    fn remove_raster_bounds_releases_cached_entry() {
+        let dispatcher = TestDispatcher::new(0);
+        let cx = TestAppContext::build(dispatcher, None);
+        let text_system = cx.text_system();
+        let params = params(12.0, 1.0);
+
+        text_system.raster_bounds.write().insert(
+            params.clone(),
+            Bounds {
+                origin: point(DevicePixels(0), DevicePixels(0)),
+                size: size(DevicePixels(1), DevicePixels(1)),
+            },
+        );
+        assert_eq!(text_system.raster_bounds.read().len(), 1);
+
+        text_system.remove_raster_bounds(&params);
+
+        assert!(text_system.raster_bounds.read().is_empty());
     }
 }
