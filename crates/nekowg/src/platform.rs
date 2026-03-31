@@ -547,6 +547,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     #[doc(hidden)]
     fn release_gpu_surface(&self, _surface_id: u64) {}
+    #[doc(hidden)]
+    fn resource_stats(&self) -> PlatformWindowResourceStats {
+        PlatformWindowResourceStats::default()
+    }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
@@ -602,6 +606,7 @@ pub trait PlatformDispatcher: Send + Sync {
 pub trait PlatformTextSystem: Send + Sync {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
     fn all_font_names(&self) -> Vec<String>;
+    fn finish_frame(&self) {}
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
     fn font_metrics(&self, font_id: FontId) -> FontMetrics;
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>>;
@@ -858,6 +863,15 @@ pub struct AtlasStats {
     pub entry_count: usize,
     pub texture_count: usize,
     pub estimated_bytes: usize,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlatformWindowResourceStats {
+    pub live_gpu_surface_count: usize,
+    pub gpu_surface_shader_cache_count: usize,
+    pub buffer_current_capacity: u64,
+    pub buffer_high_water_capacity: u64,
 }
 
 #[doc(hidden)]

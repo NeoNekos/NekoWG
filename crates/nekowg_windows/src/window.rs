@@ -956,6 +956,10 @@ impl PlatformWindow for WindowsWindow {
             .release_gpu_surface(surface_id);
     }
 
+    fn resource_stats(&self) -> nekowg::PlatformWindowResourceStats {
+        self.state.renderer.borrow().resource_stats()
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.state.renderer.borrow().sprite_atlas()
     }

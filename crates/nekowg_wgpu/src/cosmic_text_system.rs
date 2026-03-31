@@ -33,6 +33,14 @@ impl FontKey {
     }
 }
 
+const FONT_CACHE_RETAIN_FRAMES: u64 = 600;
+
+#[derive(Clone)]
+struct TimedCacheEntry<T> {
+    value: T,
+    last_used_frame: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct LoadedFontKey {
     id: cosmic_text::fontdb::ID,
@@ -54,8 +62,9 @@ struct CosmicTextSystemState {
     loaded_font_ids_by_key: HashMap<LoadedFontKey, FontId>,
     /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
     /// for every font face in a family.
-    font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
+    font_ids_by_family_cache: HashMap<FontKey, TimedCacheEntry<SmallVec<[FontId; 4]>>>,
     system_font_fallback: String,
+    current_frame: u64,
 }
 
 struct LoadedFont {
@@ -76,6 +85,7 @@ impl CosmicTextSystem {
             loaded_font_ids_by_key: HashMap::default(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
+            current_frame: 0,
         }))
     }
 
@@ -93,6 +103,7 @@ impl CosmicTextSystem {
             loaded_font_ids_by_key: HashMap::default(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
+            current_frame: 0,
         }))
     }
 }
@@ -119,17 +130,37 @@ impl PlatformTextSystem for CosmicTextSystem {
     fn font_id(&self, font: &Font) -> Result<FontId> {
         let mut state = self.0.write();
         let key = FontKey::new(font.family.clone(), font.features.clone());
-        let candidates = if let Some(font_ids) = state.font_ids_by_family_cache.get(&key) {
-            font_ids.as_slice()
+        let current_frame = state.current_frame;
+        let candidates = if let Some(entry) = state.font_ids_by_family_cache.get_mut(&key) {
+            entry.last_used_frame = current_frame;
+            entry.value.clone()
         } else {
             let font_ids = state.load_family(&font.family, &font.features)?;
-            state.font_ids_by_family_cache.insert(key.clone(), font_ids);
-            state.font_ids_by_family_cache[&key].as_ref()
+            state.font_ids_by_family_cache.insert(
+                key.clone(),
+                TimedCacheEntry {
+                    value: font_ids,
+                    last_used_frame: current_frame,
+                },
+            );
+            state.font_ids_by_family_cache[&key].value.clone()
         };
 
-        let ix = find_best_match(font, candidates, &state)?;
+        let ix = find_best_match(font, &candidates, &state)?;
 
         Ok(candidates[ix])
+    }
+
+    fn finish_frame(&self) {
+        let mut state = self.0.write();
+        state.current_frame = state.current_frame.wrapping_add(1).max(1);
+        let current_frame = state.current_frame;
+        state.font_ids_by_family_cache.retain(|_, entry| {
+            entry
+                .last_used_frame
+                .saturating_add(FONT_CACHE_RETAIN_FRAMES)
+                >= current_frame
+        });
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {

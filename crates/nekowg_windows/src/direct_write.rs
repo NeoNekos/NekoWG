@@ -59,6 +59,14 @@ impl DirectWriteFontFaceKey {
     }
 }
 
+const FONT_CACHE_RETAIN_FRAMES: u64 = 600;
+
+#[derive(Clone)]
+struct TimedCacheEntry<T> {
+    value: T,
+    last_used_frame: u64,
+}
+
 pub(crate) struct DirectWriteTextSystem {
     components: DirectWriteComponents,
     state: RwLock<DirectWriteState>,
@@ -98,10 +106,11 @@ struct DirectWriteState {
     system_font_collection: IDWriteFontCollection1,
     custom_font_collection: IDWriteFontCollection1,
     fonts: Vec<FontInfo>,
-    font_to_font_id: HashMap<Font, FontId>,
-    font_face_ids_by_key: HashMap<DirectWriteFontFaceKey, FontId>,
-    font_face_ids_by_ptr: HashMap<usize, FontId>,
+    font_to_font_id: HashMap<Font, TimedCacheEntry<FontId>>,
+    font_face_ids_by_key: HashMap<DirectWriteFontFaceKey, TimedCacheEntry<FontId>>,
+    font_face_ids_by_ptr: HashMap<usize, TimedCacheEntry<FontId>>,
     layout_line_scratch: Vec<u16>,
+    current_frame: u64,
 }
 
 impl GPUState {
@@ -240,6 +249,7 @@ impl DirectWriteTextSystem {
                 font_face_ids_by_key: HashMap::default(),
                 font_face_ids_by_ptr: HashMap::default(),
                 layout_line_scratch: Vec::new(),
+                current_frame: 0,
             }),
         })
     }
@@ -260,13 +270,45 @@ impl PlatformTextSystem for DirectWriteTextSystem {
 
     fn font_id(&self, font: &Font) -> Result<FontId> {
         let lock = self.state.upgradable_read();
+        let current_frame = lock.current_frame;
         if let Some(font_id) = lock.font_to_font_id.get(font) {
-            Ok(*font_id)
+            let font_id_value = font_id.value;
+            if font_id.last_used_frame != current_frame {
+                let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
+                if let Some(entry) = lock.font_to_font_id.get_mut(font) {
+                    entry.last_used_frame = current_frame;
+                }
+            }
+            Ok(font_id_value)
         } else {
             RwLockUpgradableReadGuard::upgrade(lock)
                 .select_and_cache_font(&self.components, font)
                 .with_context(|| format!("Failed to select font: {:?}", font))
         }
+    }
+
+    fn finish_frame(&self) {
+        let mut state = self.state.write();
+        state.current_frame = state.current_frame.wrapping_add(1).max(1);
+        let current_frame = state.current_frame;
+        state.font_to_font_id.retain(|_, entry| {
+            entry
+                .last_used_frame
+                .saturating_add(FONT_CACHE_RETAIN_FRAMES)
+                >= current_frame
+        });
+        state.font_face_ids_by_key.retain(|_, entry| {
+            entry
+                .last_used_frame
+                .saturating_add(FONT_CACHE_RETAIN_FRAMES)
+                >= current_frame
+        });
+        state.font_face_ids_by_ptr.retain(|_, entry| {
+            entry
+                .last_used_frame
+                .saturating_add(FONT_CACHE_RETAIN_FRAMES)
+                >= current_frame
+        });
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
@@ -345,16 +387,41 @@ impl DirectWriteState {
                     )
                 })?;
 
-            let font_id = FontId(this.fonts.len());
+            let current_frame = this.current_frame;
             let font_face_key = direct_write_font_face_key(
                 &info.font_face,
                 &components.locale,
                 Some(info.font_family_h.to_string_lossy().into()),
             )?;
             let font_face_ptr = info.font_face.cast::<IUnknown>().unwrap().as_raw().addr();
+            if let Some(entry) = this.font_face_ids_by_key.get_mut(&font_face_key) {
+                entry.last_used_frame = current_frame;
+                this.font_face_ids_by_ptr.insert(
+                    font_face_ptr,
+                    TimedCacheEntry {
+                        value: entry.value,
+                        last_used_frame: current_frame,
+                    },
+                );
+                return Some(entry.value);
+            }
+
+            let font_id = FontId(this.fonts.len());
             this.fonts.push(info);
-            this.font_face_ids_by_key.insert(font_face_key, font_id);
-            this.font_face_ids_by_ptr.insert(font_face_ptr, font_id);
+            this.font_face_ids_by_key.insert(
+                font_face_key,
+                TimedCacheEntry {
+                    value: font_id,
+                    last_used_frame: current_frame,
+                },
+            );
+            this.font_face_ids_by_ptr.insert(
+                font_face_ptr,
+                TimedCacheEntry {
+                    value: font_id,
+                    last_used_frame: current_frame,
+                },
+            );
             Some(font_id)
         };
 
@@ -375,7 +442,13 @@ impl DirectWriteState {
             font_id = select_font(self, font);
         };
         let font_id = font_id?;
-        self.font_to_font_id.insert(font.clone(), font_id);
+        self.font_to_font_id.insert(
+            font.clone(),
+            TimedCacheEntry {
+                value: font_id,
+                last_used_frame: self.current_frame,
+            },
+        );
         Some(font_id)
     }
 
@@ -1522,24 +1595,35 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         };
 
         let font_face_ptr = font_face.cast::<IUnknown>().unwrap().as_raw().addr();
+        let current_frame = context.text_system.current_frame;
         let font_id = context
             .text_system
             .font_face_ids_by_ptr
-            .get(&font_face_ptr)
-            .copied()
+            .get_mut(&font_face_ptr)
+            .map(|entry| {
+                entry.last_used_frame = current_frame;
+                entry.value
+            })
             .map_or_else(
                 || {
                     let font_face_key = direct_write_font_face_key(font_face, &self.locale, None)
                         .ok_or_else(|| {
                         Error::new(DWRITE_E_NOFONT, "Failed to identify font face")
                     })?;
-                    if let Some(&font_id) =
-                        context.text_system.font_face_ids_by_key.get(&font_face_key)
+                    if let Some(entry) = context
+                        .text_system
+                        .font_face_ids_by_key
+                        .get_mut(&font_face_key)
                     {
-                        context
-                            .text_system
-                            .font_face_ids_by_ptr
-                            .insert(font_face_ptr, font_id);
+                        entry.last_used_frame = current_frame;
+                        let font_id = entry.value;
+                        context.text_system.font_face_ids_by_ptr.insert(
+                            font_face_ptr,
+                            TimedCacheEntry {
+                                value: font_id,
+                                last_used_frame: current_frame,
+                            },
+                        );
                         return windows::core::Result::Ok(font_id);
                     }
 
@@ -1548,21 +1632,30 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                     // The usual culprit here seems to be Segoe UI Symbol.
                     let font = font_face_to_font(font_face, &self.locale)
                         .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?;
-                    let font_id = match context.text_system.font_to_font_id.get(&font) {
-                        Some(&font_id) => font_id,
+                    let font_id = match context.text_system.font_to_font_id.get_mut(&font) {
+                        Some(entry) => {
+                            entry.last_used_frame = current_frame;
+                            entry.value
+                        }
                         None => context
                             .text_system
                             .select_and_cache_font(context.components, &font)
                             .ok_or_else(|| Error::new(DWRITE_E_NOFONT, "Failed to create font"))?,
                     };
-                    context
-                        .text_system
-                        .font_face_ids_by_key
-                        .insert(font_face_key, font_id);
-                    context
-                        .text_system
-                        .font_face_ids_by_ptr
-                        .insert(font_face_ptr, font_id);
+                    context.text_system.font_face_ids_by_key.insert(
+                        font_face_key,
+                        TimedCacheEntry {
+                            value: font_id,
+                            last_used_frame: current_frame,
+                        },
+                    );
+                    context.text_system.font_face_ids_by_ptr.insert(
+                        font_face_ptr,
+                        TimedCacheEntry {
+                            value: font_id,
+                            last_used_frame: current_frame,
+                        },
+                    );
                     windows::core::Result::Ok(font_id)
                 },
                 Ok,
@@ -1897,7 +1990,7 @@ fn get_system_ui_font_name() -> SharedString {
             let font_name = String::from_utf16_lossy(&info.lfFaceName);
             font_name.trim_matches(char::from(0)).to_owned().into()
         };
-        log::info!("Use {} as UI font.", font_family);
+        log::debug!("Use {} as UI font.", font_family);
         font_family
     }
 }

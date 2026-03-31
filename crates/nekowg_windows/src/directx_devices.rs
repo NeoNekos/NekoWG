@@ -52,13 +52,13 @@ impl DirectXDevices {
             get_adapter(&dxgi_factory, debug_layer_available).context("Getting DXGI adapter")?;
         match feature_level {
             D3D_FEATURE_LEVEL_11_1 => {
-                log::info!("Created device with Direct3D 11.1 feature level.")
+                log::debug!("Created device with Direct3D 11.1 feature level.")
             }
             D3D_FEATURE_LEVEL_11_0 => {
-                log::info!("Created device with Direct3D 11.0 feature level.")
+                log::debug!("Created device with Direct3D 11.0 feature level.")
             }
             D3D_FEATURE_LEVEL_10_1 => {
-                log::info!("Created device with Direct3D 10.1 feature level.")
+                log::debug!("Created device with Direct3D 10.1 feature level.")
             }
             _ => unreachable!(),
         }
@@ -118,7 +118,7 @@ fn get_adapter(
             let gpu_name = String::from_utf16_lossy(&desc.Description)
                 .trim_matches(char::from(0))
                 .to_string();
-            log::info!("Using GPU: {}", gpu_name);
+            log::debug!("Using GPU: {}", gpu_name);
         }
         // Check to see whether the adapter supports Direct3D 11 and create
         // the device if it does.

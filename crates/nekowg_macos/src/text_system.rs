@@ -83,15 +83,24 @@ impl LoadedFontKey {
     }
 }
 
+const FONT_CACHE_RETAIN_FRAMES: u64 = 600;
+
+#[derive(Clone)]
+struct TimedCacheEntry<T> {
+    value: T,
+    last_used_frame: u64,
+}
+
 struct MacTextSystemState {
     memory_source: MemSource,
     system_source: SystemSource,
     fonts: Vec<FontKitFont>,
-    font_selections: HashMap<Font, FontId>,
+    font_selections: HashMap<Font, TimedCacheEntry<FontId>>,
     loaded_font_ids_by_key: HashMap<LoadedFontKey, FontId>,
     native_font_ids_by_postscript_name: HashMap<String, FontId>,
-    font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
+    font_ids_by_font_key: HashMap<FontKey, TimedCacheEntry<SmallVec<[FontId; 4]>>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    current_frame: u64,
 }
 
 impl MacTextSystem {
@@ -105,6 +114,7 @@ impl MacTextSystem {
             native_font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            current_frame: 0,
         }))
     }
 }
@@ -156,8 +166,16 @@ impl PlatformTextSystem for MacTextSystem {
 
     fn font_id(&self, font: &Font) -> Result<FontId> {
         let lock = self.0.upgradable_read();
+        let current_frame = lock.current_frame;
         if let Some(font_id) = lock.font_selections.get(font) {
-            Ok(*font_id)
+            let font_id_value = font_id.value;
+            if font_id.last_used_frame != current_frame {
+                let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
+                if let Some(entry) = lock.font_selections.get_mut(font) {
+                    entry.last_used_frame = current_frame;
+                }
+            }
+            Ok(font_id_value)
         } else {
             let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
             let font_key = FontKey {
@@ -165,13 +183,21 @@ impl PlatformTextSystem for MacTextSystem {
                 font_features: font.features.clone(),
                 font_fallbacks: font.fallbacks.clone(),
             };
-            let candidates = if let Some(font_ids) = lock.font_ids_by_font_key.get(&font_key) {
-                font_ids.as_slice()
+            let current_frame = lock.current_frame;
+            let candidates = if let Some(font_ids) = lock.font_ids_by_font_key.get_mut(&font_key) {
+                font_ids.last_used_frame = current_frame;
+                font_ids.value.as_slice()
             } else {
                 let font_ids =
                     lock.load_family(&font.family, &font.features, font.fallbacks.as_ref())?;
-                lock.font_ids_by_font_key.insert(font_key.clone(), font_ids);
-                lock.font_ids_by_font_key[&font_key].as_ref()
+                lock.font_ids_by_font_key.insert(
+                    font_key.clone(),
+                    TimedCacheEntry {
+                        value: font_ids,
+                        last_used_frame: current_frame,
+                    },
+                );
+                lock.font_ids_by_font_key[&font_key].value.as_ref()
             };
 
             let candidate_properties = candidates
@@ -189,9 +215,33 @@ impl PlatformTextSystem for MacTextSystem {
             )?;
 
             let font_id = candidates[ix];
-            lock.font_selections.insert(font.clone(), font_id);
+            lock.font_selections.insert(
+                font.clone(),
+                TimedCacheEntry {
+                    value: font_id,
+                    last_used_frame: current_frame,
+                },
+            );
             Ok(font_id)
         }
+    }
+
+    fn finish_frame(&self) {
+        let mut state = self.0.write();
+        state.current_frame = state.current_frame.wrapping_add(1).max(1);
+        let current_frame = state.current_frame;
+        state.font_selections.retain(|_, entry| {
+            entry
+                .last_used_frame
+                .saturating_add(FONT_CACHE_RETAIN_FRAMES)
+                >= current_frame
+        });
+        state.font_ids_by_font_key.retain(|_, entry| {
+            entry
+                .last_used_frame
+                .saturating_add(FONT_CACHE_RETAIN_FRAMES)
+                >= current_frame
+        });
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {

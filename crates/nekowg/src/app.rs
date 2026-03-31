@@ -644,6 +644,15 @@ pub struct App {
     pub(crate) event_arena: Arena,
 }
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AssetRegistryStats {
+    pub inflight_count: usize,
+    pub persistent_count: usize,
+    pub view_owned_count: usize,
+    pub view_ref_count_count: usize,
+}
+
 impl App {
     #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new_app(
@@ -2223,6 +2232,16 @@ impl App {
         self.view_asset_ref_counts.remove(&asset_id);
     }
 
+    #[doc(hidden)]
+    pub fn asset_registry_stats(&self) -> AssetRegistryStats {
+        AssetRegistryStats {
+            inflight_count: self.inflight_assets.len(),
+            persistent_count: self.cached_assets.len(),
+            view_owned_count: self.view_owned_assets.len(),
+            view_ref_count_count: self.view_asset_ref_counts.len(),
+        }
+    }
+
     /// Asynchronously load an asset into the app-global persistent cache.
     ///
     /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
@@ -2957,6 +2976,25 @@ mod test {
             assert_eq!(TEST_ASSET_LOADS.load(SeqCst), 1);
             assert!(!cx.inflight_assets.contains_key(&asset_id));
             assert!(cx.cached_assets.contains_key(&asset_id));
+        });
+    }
+
+    #[test]
+    fn asset_registry_stats_report_split_asset_owners() {
+        let _guard = TEST_ASSET_TEST_LOCK.lock().unwrap();
+        TEST_ASSET_LOADS.store(0, SeqCst);
+
+        let cx = TestAppContext::single();
+
+        cx.update(|cx| {
+            let _ = cx.fetch_asset::<TestAsset>(&1);
+            let _ = cx.fetch_view_asset::<TestAsset>(&2);
+
+            let stats = cx.asset_registry_stats();
+            assert_eq!(stats.inflight_count, 2);
+            assert_eq!(stats.persistent_count, 1);
+            assert_eq!(stats.view_owned_count, 1);
+            assert_eq!(stats.view_ref_count_count, 0);
         });
     }
 }

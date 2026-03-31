@@ -3,6 +3,74 @@ use bytemuck::Pod;
 use scheduler::Instant;
 use std::{collections::HashMap, mem, time::Duration};
 
+const PEAK_BUFFER_LOW_UTILIZATION_FRAMES: u32 = 120;
+const PEAK_BUFFER_SHRINK_UTILIZATION_DENOMINATOR: u64 = 4;
+
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct PeakBufferTracker {
+    initial_capacity: u64,
+    current_capacity: u64,
+    high_water_capacity: u64,
+    low_utilization_frames: u32,
+}
+
+impl PeakBufferTracker {
+    pub fn new(initial_capacity: u64) -> Self {
+        Self {
+            initial_capacity,
+            current_capacity: initial_capacity,
+            high_water_capacity: initial_capacity,
+            low_utilization_frames: 0,
+        }
+    }
+
+    pub fn note_resize(&mut self, new_capacity: u64) {
+        self.current_capacity = new_capacity;
+        self.high_water_capacity = self.high_water_capacity.max(new_capacity);
+        self.low_utilization_frames = 0;
+    }
+
+    pub fn current_capacity(&self) -> u64 {
+        self.current_capacity
+    }
+
+    pub fn high_water_capacity(&self) -> u64 {
+        self.high_water_capacity
+    }
+
+    pub fn maybe_shrink(&mut self, used: u64) -> Option<u64> {
+        if self.current_capacity <= self.initial_capacity {
+            self.low_utilization_frames = 0;
+            return None;
+        }
+
+        if used.saturating_mul(PEAK_BUFFER_SHRINK_UTILIZATION_DENOMINATOR) > self.current_capacity {
+            self.low_utilization_frames = 0;
+            return None;
+        }
+
+        self.low_utilization_frames = self.low_utilization_frames.saturating_add(1);
+        if self.low_utilization_frames < PEAK_BUFFER_LOW_UTILIZATION_FRAMES {
+            return None;
+        }
+
+        self.low_utilization_frames = 0;
+        let target = peak_buffer_target_capacity(self.initial_capacity, used);
+        if target < self.current_capacity {
+            self.current_capacity = target;
+            Some(target)
+        } else {
+            None
+        }
+    }
+}
+
+fn peak_buffer_target_capacity(initial_capacity: u64, used: u64) -> u64 {
+    let required = used.max(1).saturating_mul(2);
+    initial_capacity.max(required.next_power_of_two())
+}
+
 /// A GPU surface extent in physical pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GpuExtent {
@@ -1621,5 +1689,35 @@ mod tests {
             error,
             GpuGraphValidationError::MissingRenderProgram(GpuRenderProgramHandle(123))
         );
+    }
+
+    #[test]
+    fn peak_buffer_tracker_requires_sustained_underuse_before_shrinking() {
+        let mut tracker = PeakBufferTracker::new(64);
+        tracker.note_resize(256);
+
+        for _ in 0..119 {
+            assert_eq!(tracker.maybe_shrink(32), None);
+        }
+
+        assert_eq!(tracker.maybe_shrink(32), Some(64));
+        assert_eq!(tracker.current_capacity(), 64);
+        assert_eq!(tracker.high_water_capacity(), 256);
+    }
+
+    #[test]
+    fn peak_buffer_tracker_resets_hysteresis_when_usage_recovers() {
+        let mut tracker = PeakBufferTracker::new(64);
+        tracker.note_resize(256);
+
+        for _ in 0..60 {
+            assert_eq!(tracker.maybe_shrink(16), None);
+        }
+        assert_eq!(tracker.maybe_shrink(128), None);
+        for _ in 0..119 {
+            assert_eq!(tracker.maybe_shrink(16), None);
+        }
+
+        assert_eq!(tracker.maybe_shrink(16), Some(64));
     }
 }

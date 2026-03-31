@@ -123,6 +123,31 @@ struct DirectXRenderPipelines {
     surface_pipeline: PipelineState<SurfaceSprite>,
 }
 
+impl DirectXRenderPipelines {
+    fn buffer_stats(&self) -> (u64, u64) {
+        let pipelines = [
+            self.shadow_pipeline.buffer_stats(),
+            self.quad_pipeline.buffer_stats(),
+            self.backdrop_blur_h_pipeline.buffer_stats(),
+            self.backdrop_blur_composite_pipeline.buffer_stats(),
+            self.backdrop_blur_blit_pipeline.buffer_stats(),
+            self.path_rasterization_pipeline.buffer_stats(),
+            self.path_sprite_pipeline.buffer_stats(),
+            self.underline_pipeline.buffer_stats(),
+            self.mono_sprites.buffer_stats(),
+            self.subpixel_sprites.buffer_stats(),
+            self.poly_sprites.buffer_stats(),
+            self.surface_pipeline.buffer_stats(),
+        ];
+        pipelines.into_iter().fold(
+            (0, 0),
+            |(current, high), (pipeline_current, pipeline_high)| {
+                (current + pipeline_current, high + pipeline_high)
+            },
+        )
+    }
+}
+
 struct DirectXGlobalElements {
     global_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
@@ -2204,6 +2229,17 @@ impl DirectXRenderer {
         prune_unreferenced_gpu_surface_programs(&mut self.gpu_surface_render_program_cache);
         prune_unreferenced_gpu_surface_programs(&mut self.gpu_surface_compute_program_cache);
     }
+
+    pub(crate) fn resource_stats(&self) -> PlatformWindowResourceStats {
+        let (buffer_current_capacity, buffer_high_water_capacity) = self.pipelines.buffer_stats();
+        PlatformWindowResourceStats {
+            live_gpu_surface_count: self.gpu_surfaces.len(),
+            gpu_surface_shader_cache_count: self.gpu_surface_render_program_cache.len()
+                + self.gpu_surface_compute_program_cache.len(),
+            buffer_current_capacity,
+            buffer_high_water_capacity,
+        }
+    }
 }
 
 fn prune_unreferenced_gpu_surface_programs<K, T>(cache: &mut HashMap<K, Arc<T>>)
@@ -2557,6 +2593,7 @@ struct PipelineState<T> {
     fragment: ID3D11PixelShader,
     buffer: ID3D11Buffer,
     buffer_size: usize,
+    buffer_tracker: PeakBufferTracker,
     view: Option<ID3D11ShaderResourceView>,
     blend_state: ID3D11BlendState,
     _marker: std::marker::PhantomData<T>,
@@ -2587,6 +2624,7 @@ impl<T> PipelineState<T> {
             fragment,
             buffer,
             buffer_size,
+            buffer_tracker: PeakBufferTracker::new(buffer_size as u64),
             view,
             blend_state,
             _marker: std::marker::PhantomData,
@@ -2612,8 +2650,29 @@ impl<T> PipelineState<T> {
             self.buffer = buffer;
             self.view = view;
             self.buffer_size = new_buffer_size;
+            self.buffer_tracker.note_resize(new_buffer_size as u64);
+        } else if let Some(new_buffer_size) = self.buffer_tracker.maybe_shrink(data.len() as u64) {
+            let new_buffer_size = new_buffer_size as usize;
+            log::debug!(
+                "Reducing {} buffer size from {} to {}",
+                self.label,
+                self.buffer_size,
+                new_buffer_size
+            );
+            let buffer = create_buffer(device, std::mem::size_of::<T>(), new_buffer_size)?;
+            let view = create_buffer_view(device, &buffer)?;
+            self.buffer = buffer;
+            self.view = view;
+            self.buffer_size = new_buffer_size;
         }
         update_buffer(device_context, &self.buffer, data)
+    }
+
+    fn buffer_stats(&self) -> (u64, u64) {
+        (
+            self.buffer_tracker.current_capacity(),
+            self.buffer_tracker.high_water_capacity(),
+        )
     }
 
     fn draw(

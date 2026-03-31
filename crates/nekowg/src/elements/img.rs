@@ -972,42 +972,11 @@ impl Asset for ImageAssetLoader {
                     }
                 };
 
-                if log::log_enabled!(log::Level::Debug) {
-                    let frame_count = image.frame_count();
-                    let first_size = image.size(0);
-                    let mut total_pixels_bytes: usize = 0;
-                    for index in 0..frame_count {
-                        let size = image.size(index);
-                        total_pixels_bytes = total_pixels_bytes
-                            .saturating_add(size.width.0 as usize * size.height.0 as usize * 4);
-                    }
-                    log::debug!(
-                        "image decoded: source={:?} format={:?} encoded_bytes={} frames={} first={}x{} est_pixels_bytes={}",
-                        source,
-                        format,
-                        bytes.len(),
-                        frame_count,
-                        first_size.width.0,
-                        first_size.height.0,
-                        total_pixels_bytes
-                    );
-                }
-
                 Ok(Arc::new(image))
             } else {
                 let image = svg_renderer
                     .render_single_frame(&bytes, 1.0, true)
                     .map_err(ImageCacheError::from)?;
-                if log::log_enabled!(log::Level::Debug) {
-                    let size = image.size(0);
-                    log::debug!(
-                        "svg decoded: source={:?} encoded_bytes={} size={}x{}",
-                        source,
-                        bytes.len(),
-                        size.width.0,
-                        size.height.0
-                    );
-                }
                 Ok(image)
             }
         }

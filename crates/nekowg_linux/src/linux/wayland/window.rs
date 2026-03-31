@@ -1415,6 +1415,10 @@ impl PlatformWindow for WaylandWindow {
         self.borrow_mut().renderer.release_gpu_surface(surface_id);
     }
 
+    fn resource_stats(&self) -> nekowg::PlatformWindowResourceStats {
+        self.borrow().renderer.resource_stats()
+    }
+
     fn completed_frame(&self) {
         let state = self.borrow();
         if !state.visible {

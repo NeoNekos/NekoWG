@@ -966,6 +966,16 @@ pub struct Window {
     inspector: Option<Entity<Inspector>>,
 }
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowResourceStats {
+    pub assets: crate::AssetRegistryStats,
+    pub atlas: crate::AtlasStats,
+    pub text_system: crate::TextSystemStats,
+    pub svg_renderer: crate::SvgRendererStats,
+    pub platform: crate::PlatformWindowResourceStats,
+}
+
 #[derive(Clone, Debug, Default)]
 struct ModifierState {
     modifiers: Modifiers,
@@ -1926,6 +1936,17 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+    }
+
+    #[doc(hidden)]
+    pub fn resource_stats(&self, cx: &App) -> WindowResourceStats {
+        WindowResourceStats {
+            assets: cx.asset_registry_stats(),
+            atlas: self.sprite_atlas.stats(),
+            text_system: self.text_system().stats(),
+            svg_renderer: cx.svg_renderer().stats(),
+            platform: self.platform_window.resource_stats(),
+        }
     }
 
     /// Schedule a frame to be drawn on the next animation frame.
@@ -5669,6 +5690,7 @@ fn released_gpu_surface_ids(previous: &[u64], current: &[u64]) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::released_gpu_surface_ids;
+    use crate::{Empty, TestAppContext};
 
     #[test]
     fn gpu_surface_release_diff_ignores_still_live_and_duplicate_ids() {
@@ -5677,6 +5699,30 @@ mod tests {
         assert_eq!(released.len(), 2);
         assert!(released.contains(&1));
         assert!(released.contains(&3));
+    }
+
+    #[test]
+    fn window_resource_stats_aggregate_subsystem_counters() {
+        let mut cx = TestAppContext::single();
+        let handle = cx.add_window(|_, _| Empty);
+        cx.run_until_parked();
+
+        let stats = handle
+            .update(&mut cx, |_, window, cx| window.resource_stats(cx))
+            .unwrap();
+
+        assert_eq!(stats.assets.inflight_count, 0);
+        assert_eq!(stats.assets.persistent_count, 0);
+        assert_eq!(stats.assets.view_owned_count, 0);
+        assert_eq!(stats.atlas.entry_count, 0);
+        assert_eq!(stats.text_system.raster_bounds_count, 0);
+        assert_eq!(stats.svg_renderer.parsed_document_count, 0);
+        assert_eq!(stats.platform.live_gpu_surface_count, 0);
+
+        handle
+            .update(&mut cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
     }
 }
 

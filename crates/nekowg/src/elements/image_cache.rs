@@ -411,23 +411,12 @@ impl LruImageCache {
                     .map(|image| image.memory_bytes_len())
                     .unwrap_or(0);
                 if new_bytes != entry.bytes {
-                    let old_bytes = entry.bytes;
                     if new_bytes > entry.bytes {
                         self.current_bytes += new_bytes - entry.bytes;
                     } else {
                         self.current_bytes -= entry.bytes - new_bytes;
                     }
                     entry.bytes = new_bytes;
-                    if log::log_enabled!(log::Level::Debug) {
-                        log::debug!(
-                            "image cache bytes update: source={:?} bytes={} -> {} current={} max={}",
-                            entry.source,
-                            old_bytes,
-                            new_bytes,
-                            self.current_bytes,
-                            self.max_bytes
-                        );
-                    }
                 }
                 self.evict_if_needed(window, cx);
             }
@@ -475,15 +464,6 @@ impl LruImageCache {
 
             if let Some(entry) = self.entries.remove(&candidate) {
                 self.current_bytes = self.current_bytes.saturating_sub(entry.bytes);
-                if log::log_enabled!(log::Level::Debug) {
-                    log::debug!(
-                        "image cache evict: source={:?} bytes={} current={} max={}",
-                        entry.source,
-                        entry.bytes,
-                        self.current_bytes,
-                        self.max_bytes
-                    );
-                }
                 self.evict_entry(entry, Some(window), cx);
             }
         }

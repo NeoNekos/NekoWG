@@ -47,6 +47,12 @@ pub struct SvgRenderer {
     parsed_document_cache: Arc<RwLock<HashMap<u64, Arc<ParsedSvgDocument>>>>,
 }
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SvgRendererStats {
+    pub parsed_document_count: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct ParsedSvgDocument(Arc<usvg::Tree>);
 
@@ -178,6 +184,13 @@ impl SvgRenderer {
         self.parse_document(&bytes)
             .map(Some)
             .map_err(anyhow::Error::from)
+    }
+
+    #[doc(hidden)]
+    pub fn stats(&self) -> SvgRendererStats {
+        SvgRendererStats {
+            parsed_document_count: self.parsed_document_cache.read().len(),
+        }
     }
 
     pub(crate) fn render_alpha_mask_from_document(

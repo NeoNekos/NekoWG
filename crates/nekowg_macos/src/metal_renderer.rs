@@ -15,8 +15,8 @@ use nekowg::{
     GpuFrameContext, GpuGraphOperation, GpuRecordedGraph, GpuRenderPassDesc, GpuRenderProgramDesc,
     GpuRenderProgramHandle, GpuSamplerDesc, GpuSamplerHandle, GpuSurfaceExecutionInput,
     GpuTextureDesc, GpuTextureFormat, GpuTextureHandle, Hsla, MonochromeSprite, PaintSurface, Path,
-    Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, Underline,
-    point, px, size,
+    PeakBufferTracker, PlatformWindowResourceStats, Point, PolychromeSprite, PrimitiveBatch, Quad,
+    ScaledPixels, Scene, Shadow, Size, Underline, point, px, size,
 };
 
 use core_foundation::base::TCFType;
@@ -66,6 +66,7 @@ pub(crate) unsafe fn new_renderer(
 
 pub(crate) struct InstanceBufferPool {
     buffer_size: usize,
+    buffer_tracker: PeakBufferTracker,
     buffers: Vec<metal::Buffer>,
 }
 
@@ -73,6 +74,7 @@ impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
             buffer_size: 2 * 1024 * 1024,
+            buffer_tracker: PeakBufferTracker::new((2 * 1024 * 1024) as u64),
             buffers: Vec::new(),
         }
     }
@@ -81,11 +83,13 @@ impl Default for InstanceBufferPool {
 pub(crate) struct InstanceBuffer {
     metal_buffer: metal::Buffer,
     size: usize,
+    used: usize,
 }
 
 impl InstanceBufferPool {
     pub(crate) fn reset(&mut self, buffer_size: usize) {
         self.buffer_size = buffer_size;
+        self.buffer_tracker.note_resize(buffer_size as u64);
         self.buffers.clear();
     }
 
@@ -109,10 +113,15 @@ impl InstanceBufferPool {
         InstanceBuffer {
             metal_buffer: buffer,
             size: self.buffer_size,
+            used: 0,
         }
     }
 
     pub(crate) fn release(&mut self, buffer: InstanceBuffer) {
+        if let Some(new_size) = self.buffer_tracker.maybe_shrink(buffer.used as u64) {
+            self.buffer_size = new_size as usize;
+            self.buffers.clear();
+        }
         if buffer.size == self.buffer_size {
             self.buffers.push(buffer.metal_buffer)
         }
@@ -857,6 +866,16 @@ impl MetalRenderer {
 
     pub(crate) fn release_gpu_surface(&mut self, surface_id: u64) {
         self.gpu_surfaces.remove(&surface_id);
+    }
+
+    pub(crate) fn resource_stats(&self) -> PlatformWindowResourceStats {
+        let pool = self.instance_buffer_pool.lock();
+        PlatformWindowResourceStats {
+            live_gpu_surface_count: self.gpu_surfaces.len(),
+            gpu_surface_shader_cache_count: 0,
+            buffer_current_capacity: pool.buffer_tracker.current_capacity(),
+            buffer_high_water_capacity: pool.buffer_tracker.high_water_capacity(),
+        }
     }
 
     pub(crate) fn paint_gpu_surface(
@@ -1639,6 +1658,8 @@ impl MetalRenderer {
                 length: instance_offset as NSUInteger,
             });
         }
+
+        instance_buffer.used = instance_offset;
 
         Ok(command_buffer.to_owned())
     }

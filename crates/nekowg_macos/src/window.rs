@@ -1586,6 +1586,10 @@ impl PlatformWindow for MacWindow {
         self.0.lock().renderer.release_gpu_surface(surface_id);
     }
 
+    fn resource_stats(&self) -> nekowg::PlatformWindowResourceStats {
+        self.0.lock().renderer.resource_stats()
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }

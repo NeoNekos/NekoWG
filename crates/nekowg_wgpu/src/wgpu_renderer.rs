@@ -9,8 +9,9 @@ use nekowg::{
     GpuFrameContext, GpuGraphOperation, GpuRecordedGraph, GpuRenderPassDesc, GpuRenderProgramDesc,
     GpuRenderProgramHandle, GpuSamplerDesc, GpuSamplerHandle, GpuSpecs, GpuSurfaceExecutionInput,
     GpuTextureDesc, GpuTextureFormat, GpuTextureHandle, Hsla, MonochromeSprite, PaintSurface, Path,
-    Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    SubpixelSprite, Underline, get_gamma_correction_ratios, point, px, size,
+    PeakBufferTracker, PlatformWindowResourceStats, Point, PolychromeSprite, PrimitiveBatch, Quad,
+    ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline, get_gamma_correction_ratios,
+    point, px, size,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
@@ -795,6 +796,7 @@ pub struct WgpuRenderer {
     path_globals_offset: u64,
     gamma_offset: u64,
     instance_buffer_capacity: u64,
+    instance_buffer_tracker: PeakBufferTracker,
     max_buffer_size: u64,
     storage_buffer_alignment: u64,
     rendering_params: RenderingParameters,
@@ -1118,6 +1120,7 @@ impl WgpuRenderer {
             path_globals_offset,
             gamma_offset,
             instance_buffer_capacity: initial_instance_buffer_capacity,
+            instance_buffer_tracker: PeakBufferTracker::new(initial_instance_buffer_capacity),
             max_buffer_size,
             storage_buffer_alignment,
             rendering_params,
@@ -1900,6 +1903,15 @@ impl WgpuRenderer {
         self.gpu_surfaces.remove(&surface_id);
     }
 
+    pub fn resource_stats(&self) -> PlatformWindowResourceStats {
+        PlatformWindowResourceStats {
+            live_gpu_surface_count: self.gpu_surfaces.len(),
+            gpu_surface_shader_cache_count: 0,
+            buffer_current_capacity: self.instance_buffer_tracker.current_capacity(),
+            buffer_high_water_capacity: self.instance_buffer_tracker.high_water_capacity(),
+        }
+    }
+
     pub fn paint_gpu_surface(
         &mut self,
         input: GpuSurfaceExecutionInput<'_>,
@@ -2230,6 +2242,7 @@ impl WgpuRenderer {
                 .queue
                 .submit(std::iter::once(encoder.finish()));
             frame.present();
+            self.maybe_shrink_instance_buffer(instance_offset);
             return;
         }
     }
@@ -3032,6 +3045,27 @@ impl WgpuRenderer {
     fn grow_instance_buffer(&mut self) {
         let new_capacity = (self.instance_buffer_capacity * 2).min(self.max_buffer_size);
         log::info!("increased instance buffer size to {}", new_capacity);
+        let resources = self.resources_mut();
+        resources.instance_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("instance_buffer"),
+            size: new_capacity,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.instance_buffer_capacity = new_capacity;
+        self.instance_buffer_tracker.note_resize(new_capacity);
+    }
+
+    fn maybe_shrink_instance_buffer(&mut self, used_bytes: u64) {
+        let Some(new_capacity) = self.instance_buffer_tracker.maybe_shrink(used_bytes) else {
+            return;
+        };
+
+        log::info!(
+            "reduced instance buffer size from {} to {}",
+            self.instance_buffer_capacity,
+            new_capacity
+        );
         let resources = self.resources_mut();
         resources.instance_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instance_buffer"),

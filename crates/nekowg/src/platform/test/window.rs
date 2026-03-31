@@ -293,6 +293,15 @@ impl PlatformWindow for TestWindow {
         self.0.lock().released_gpu_surface_ids.push(surface_id);
     }
 
+    fn resource_stats(&self) -> crate::PlatformWindowResourceStats {
+        crate::PlatformWindowResourceStats {
+            live_gpu_surface_count: 0,
+            gpu_surface_shader_cache_count: 0,
+            buffer_current_capacity: 0,
+            buffer_high_water_capacity: 0,
+        }
+    }
+
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
         self.0.lock().sprite_atlas.clone()
     }

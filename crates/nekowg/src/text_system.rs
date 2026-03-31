@@ -29,7 +29,10 @@ use std::{
     fmt::{Debug, Display, Formatter},
     hash::{Hash, Hasher},
     ops::{Deref, DerefMut, Range},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// An opaque identifier for a specific font.
@@ -53,16 +56,34 @@ pub const SUBPIXEL_VARIANTS_Y: u8 = if cfg!(target_os = "windows") || cfg!(targe
 
 const LINE_WRAPPER_POOL_BUCKETS_PER_PIXEL: f32 = 2.0;
 const MAX_LINE_WRAPPERS_PER_BUCKET: usize = 4;
+const TEXT_CACHE_RETAIN_FRAMES: u64 = 600;
+
+#[derive(Clone)]
+struct TimedCacheEntry<T> {
+    value: T,
+    last_used_frame: u64,
+}
 
 /// The NekoWG text rendering sub system.
 pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
-    font_ids_by_font: RwLock<FxHashMap<Font, Result<FontId>>>,
-    font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
+    font_ids_by_font: RwLock<FxHashMap<Font, TimedCacheEntry<Result<FontId>>>>,
+    font_metrics: RwLock<FxHashMap<FontId, TimedCacheEntry<FontMetrics>>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
     fallback_font_stack: SmallVec<[Font; 2]>,
+    current_frame: AtomicU64,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextSystemStats {
+    pub font_selection_count: usize,
+    pub font_metrics_count: usize,
+    pub raster_bounds_count: usize,
+    pub wrapper_bucket_count: usize,
+    pub wrapper_count: usize,
 }
 
 impl TextSystem {
@@ -74,6 +95,7 @@ impl TextSystem {
             font_ids_by_font: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
+            current_frame: AtomicU64::new(0),
             fallback_font_stack: smallvec![
                 // TODO: Remove this when Linux have implemented setting fallbacks.
                 font(".ZedMono"),
@@ -118,18 +140,27 @@ impl TextSystem {
             }
         }
 
-        let font_id = self
-            .font_ids_by_font
-            .read()
-            .get(font)
-            .map(clone_font_id_result);
-        if let Some(font_id) = font_id {
+        let current_frame = self.current_frame.load(Ordering::Relaxed);
+        let lock = self.font_ids_by_font.upgradable_read();
+        if let Some(entry) = lock.get(font) {
+            let font_id = clone_font_id_result(&entry.value);
+            if entry.last_used_frame != current_frame {
+                let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
+                if let Some(entry) = lock.get_mut(font) {
+                    entry.last_used_frame = current_frame;
+                }
+            }
             font_id
         } else {
             let font_id = self.platform_text_system.font_id(font);
-            self.font_ids_by_font
-                .write()
-                .insert(font.clone(), clone_font_id_result(&font_id));
+            let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
+            lock.insert(
+                font.clone(),
+                TimedCacheEntry {
+                    value: clone_font_id_result(&font_id),
+                    last_used_frame: current_frame,
+                },
+            );
             font_id
         }
     }
@@ -138,7 +169,7 @@ impl TextSystem {
     pub fn get_font_for_id(&self, id: FontId) -> Option<Font> {
         let lock = self.font_ids_by_font.read();
         lock.iter()
-            .filter_map(|(font, result)| match result {
+            .filter_map(|(font, entry)| match &entry.value {
                 Ok(font_id) if *font_id == id => Some(font.clone()),
                 _ => None,
             })
@@ -302,16 +333,25 @@ impl TextSystem {
     }
 
     fn read_metrics<T>(&self, font_id: FontId, read: impl FnOnce(&FontMetrics) -> T) -> T {
+        let current_frame = self.current_frame.load(Ordering::Relaxed);
         let lock = self.font_metrics.upgradable_read();
 
         if let Some(metrics) = lock.get(&font_id) {
-            read(metrics)
+            let value = read(&metrics.value);
+            if metrics.last_used_frame != current_frame {
+                let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
+                if let Some(metrics) = lock.get_mut(&font_id) {
+                    metrics.last_used_frame = current_frame;
+                }
+            }
+            value
         } else {
             let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
-            let metrics = lock
-                .entry(font_id)
-                .or_insert_with(|| self.platform_text_system.font_metrics(font_id));
-            read(metrics)
+            let metrics = lock.entry(font_id).or_insert_with(|| TimedCacheEntry {
+                value: self.platform_text_system.font_metrics(font_id),
+                last_used_frame: current_frame,
+            });
+            read(&metrics.value)
         }
     }
 
@@ -353,6 +393,18 @@ impl TextSystem {
         self.raster_bounds.write().remove(params);
     }
 
+    #[doc(hidden)]
+    pub fn stats(&self) -> TextSystemStats {
+        let wrapper_pool = self.wrapper_pool.lock();
+        TextSystemStats {
+            font_selection_count: self.font_ids_by_font.read().len(),
+            font_metrics_count: self.font_metrics.read().len(),
+            raster_bounds_count: self.raster_bounds.read().len(),
+            wrapper_bucket_count: wrapper_pool.len(),
+            wrapper_count: wrapper_pool.values().map(Vec::len).sum(),
+        }
+    }
+
     pub(crate) fn rasterize_glyph(
         &self,
         params: &RenderGlyphParams,
@@ -371,6 +423,26 @@ impl TextSystem {
     ) -> TextRenderingMode {
         self.platform_text_system
             .recommended_rendering_mode(font_id, font_size)
+    }
+
+    fn finish_frame(&self) {
+        let current_frame = self
+            .current_frame
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+            .max(1);
+        self.font_ids_by_font.write().retain(|_, entry| {
+            entry
+                .last_used_frame
+                .saturating_add(TEXT_CACHE_RETAIN_FRAMES)
+                >= current_frame
+        });
+        self.font_metrics.write().retain(|_, entry| {
+            entry
+                .last_used_frame
+                .saturating_add(TEXT_CACHE_RETAIN_FRAMES)
+                >= current_frame
+        });
     }
 }
 
@@ -581,6 +653,8 @@ impl WindowTextSystem {
     }
 
     pub(crate) fn finish_frame(&self) {
+        self.text_system.finish_frame();
+        self.text_system.platform_text_system.finish_frame();
         self.line_layout_cache.finish_frame()
     }
 
