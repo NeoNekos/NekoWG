@@ -4,11 +4,11 @@ use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App,
     AppContext, Arena, Asset, AsyncWindowContext, AtlasKey, AvailableSpace, BackdropFilter,
     Background, BorderStyle, Bounds, BoxShadow, Capslock, Context, Corners, CursorStyle,
-    DEFAULT_IMAGE_CACHE_BYTES, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId,
+    Decorations, DevicePixels, DispatchActionListener, DispatchNodeId,
     DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId,
     Global, GlobalElementId, GlyphId, GpuRecordedGraph, GpuSpecs, GpuSurfaceExecutionInput,
     GpuTextureDesc, GpuTextureHandle, Hsla, InputHandler, IsZero, KeyBinding, KeyContext,
-    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, LruImageCache,
+    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex,
     Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
     MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
@@ -1405,8 +1405,6 @@ impl Window {
 
         platform_window.map_window().unwrap();
 
-        let default_image_cache = LruImageCache::new(DEFAULT_IMAGE_CACHE_BYTES, cx);
-
         Ok(Window {
             handle,
             invalidator,
@@ -1461,7 +1459,7 @@ impl Window {
             pending_input_observers: SubscriberSet::new(),
             prompt: None,
             client_inset: None,
-            image_cache_stack: vec![default_image_cache.into()],
+            image_cache_stack: Vec::new(),
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
         })

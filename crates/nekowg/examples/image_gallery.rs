@@ -2,7 +2,7 @@ use futures::FutureExt;
 use nekowg::{
     App, AppContext, Asset as _, AssetLogger, Bounds, ClickEvent, Context, ElementId, Entity,
     ImageAssetLoader, ImageCache, ImageCacheProvider, KeyBinding, Menu, MenuItem,
-    RetainAllImageCache, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    LruImageCache, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
     actions, div, hash, image_cache, img, prelude::*, px, rgb, size,
 };
 use reqwest_client::ReqwestClient;
@@ -14,7 +14,7 @@ struct ImageGallery {
     image_key: String,
     items_count: usize,
     total_count: usize,
-    image_cache: Entity<RetainAllImageCache>,
+    image_cache: Entity<LruImageCache>,
 }
 
 impl ImageGallery {
@@ -280,7 +280,7 @@ fn run_example() {
                 image_key: "".into(),
                 items_count: IMAGES_IN_GALLERY,
                 total_count: 0,
-                image_cache: RetainAllImageCache::new(ctx),
+                image_cache: LruImageCache::new(64 * 1024 * 1024, ctx),
             })
         })
         .unwrap();

@@ -227,8 +227,8 @@ impl Img {
     /// If the `image_cache` is not explicitly provided, the function will determine the image cache by:
     ///
     /// 1. Checking if any ancestor node of the current node contains an `ImageCacheElement`, If such a node exists, the image cache specified by that ancestor will be used.
-    /// 2. If no ancestor node contains an `ImageCacheElement`, the global image cache will be used as a fallback.
-    ///    The default global cache is an LRU with a 64MB budget.
+    /// 2. If no ancestor node contains an `ImageCacheElement`, no image cache is applied by default.
+    ///    In this mode, loading falls back to the view-scoped asset path.
     ///
     /// This mechanism provides a flexible way to manage image caching, allowing precise control when needed,
     /// while ensuring a default behavior when no cache is explicitly specified.
